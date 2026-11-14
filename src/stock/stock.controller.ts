@@ -1,6 +1,7 @@
 import { Body, Controller, Get, Post, Query } from '@nestjs/common';
 import { z } from 'zod';
 import {
+  can,
   inventoryCountSchema,
   movementInputSchema,
   movementTypeSchema,
@@ -11,6 +12,7 @@ import {
   type TransferInput,
 } from '../shared/index.js';
 import { CurrentUser, RequirePermission } from '../auth/auth.guard.js';
+import { redactMovement } from '../catalog/redact.js';
 import { StockService, type MovementQuery } from './stock.service.js';
 
 const movementQuerySchema = z.object({
@@ -27,8 +29,9 @@ export class StockController {
 
   /** Journal immuable des mouvements, du plus récent au plus ancien. */
   @Get('movements')
-  movements(@Query({ schema: movementQuerySchema }) query: MovementQuery) {
-    return this.stock.movements(query);
+  async movements(@Query({ schema: movementQuerySchema }) query: MovementQuery, @CurrentUser() user: AuthUser) {
+    const page = await this.stock.movements(query);
+    return can(user.role, 'viewCosts') ? page : { ...page, items: page.items.map(redactMovement) };
   }
 
   /** Réception fournisseur, retour client, perte, retour fournisseur. */

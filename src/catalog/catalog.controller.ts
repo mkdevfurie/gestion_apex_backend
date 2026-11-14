@@ -3,16 +3,18 @@ import { z } from 'zod';
 import { Prisma } from '../generated/prisma/client.js';
 import { PrismaService } from '../prisma/prisma.service.js';
 import {
+  can,
   categoryInputSchema,
   productInputSchema,
   productUpdateSchema,
   stockStatusSchema,
+  type AuthUser,
   type Category,
   type ProductInput,
   type ProductUpdate,
-  type Warehouse,
 } from '../shared/index.js';
-import { RequirePermission } from '../auth/auth.guard.js';
+import { CurrentUser, RequirePermission } from '../auth/auth.guard.js';
+import { redactProductPage, redactProductDetail } from './redact.js';
 import { ProductsService, type ProductQuery } from './products.service.js';
 
 const uuid = z.string().uuid();
@@ -33,15 +35,6 @@ export class CatalogController {
     private readonly prisma: PrismaService,
     private readonly products: ProductsService,
   ) {}
-
-  @Get('warehouses')
-  async warehouses(): Promise<Warehouse[]> {
-    return this.prisma.warehouse.findMany({
-      where: { active: true },
-      orderBy: { code: 'asc' },
-      select: { id: true, code: true, name: true, address: true, active: true },
-    });
-  }
 
   @Get('categories')
   async categories(): Promise<Category[]> {
@@ -67,16 +60,19 @@ export class CatalogController {
   }
 
   @Get('products')
-  list(@Query({ schema: productQuerySchema }) query: ProductQuery) {
-    return this.products.list(query);
+  async list(@Query({ schema: productQuerySchema }) query: ProductQuery, @CurrentUser() user: AuthUser) {
+    const page = await this.products.list(query);
+    return can(user.role, 'viewCosts') ? page : redactProductPage(page);
   }
 
   @Get('products/:id')
-  detail(
+  async detail(
     @Param('id', { schema: uuid }) id: string,
+    @CurrentUser() user: AuthUser,
     @Query('warehouseId', { schema: uuid.optional() }) warehouseId?: string,
   ) {
-    return this.products.detail(id, warehouseId);
+    const detail = await this.products.detail(id, warehouseId);
+    return can(user.role, 'viewCosts') ? detail : redactProductDetail(detail);
   }
 
   @Post('products')

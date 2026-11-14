@@ -8,6 +8,7 @@ import {
 import { createHash } from 'node:crypto';
 import { Prisma } from '../generated/prisma/client.js';
 import { PrismaService } from '../prisma/prisma.service.js';
+import { SettingsService } from '../settings/settings.service.js';
 import { InsufficientStockError, applyMovement } from '../stock/apply-movement.js';
 import {
   can,
@@ -39,7 +40,10 @@ const receiptInclude = {
 
 @Injectable()
 export class SalesService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly settings: SettingsService,
+  ) {}
 
   /**
    * Vente comptoir (ticket). Tout ou rien, dans une seule transaction :
@@ -58,6 +62,10 @@ export class SalesService {
 
     if (input.lines.some((l) => l.discountRate > 0) && !can(user.role, 'grantDiscount')) {
       throw new ForbiddenException('Seul un gérant peut accorder une remise');
+    }
+    const { maxDiscountRate } = await this.settings.get();
+    if (input.lines.some((l) => l.discountRate > maxDiscountRate)) {
+      throw new BadRequestException(`Remise maximale autorisée : ${maxDiscountRate} %`);
     }
 
     const session = await this.prisma.cashSession.findFirst({
@@ -217,9 +225,10 @@ export class SalesService {
   }
 
   async receipt(id: string): Promise<SaleReceipt> {
-    const [inv, company] = await Promise.all([
+    const [inv, company, settings] = await Promise.all([
       this.prisma.invoice.findUnique({ where: { id }, include: receiptInclude }),
       this.prisma.company.findUnique({ where: { id: 1 } }),
+      this.settings.get(),
     ]);
     if (!inv || !inv.number || !inv.issuedAt) throw new NotFoundException('Ticket introuvable');
 
@@ -261,6 +270,7 @@ export class SalesService {
       cashTendered: inv.cashTendered,
       change: inv.changeGiven,
       hash: inv.hash ?? '',
+      footer: settings.receiptFooter,
     };
   }
 

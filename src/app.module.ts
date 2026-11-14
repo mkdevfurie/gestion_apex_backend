@@ -8,16 +8,20 @@ import { CatalogModule } from './catalog/catalog.module.js';
 import { StockModule } from './stock/stock.module.js';
 import { UsersModule } from './users/users.module.js';
 import { PosModule } from './pos/pos.module.js';
+import { SettingsModule } from './settings/settings.module.js';
+import { ReportsModule } from './reports/reports.module.js';
 
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true, validate: validateEnv }),
     PrismaModule,
     AuthModule,
+    SettingsModule,
     CatalogModule,
     StockModule,
     UsersModule,
     PosModule,
+    ReportsModule,
   ],
   controllers: [AppController],
 })

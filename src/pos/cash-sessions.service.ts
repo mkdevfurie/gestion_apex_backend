@@ -1,8 +1,10 @@
-import { ConflictException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
 import type { Prisma } from '../generated/prisma/client.js';
 import { PrismaService } from '../prisma/prisma.service.js';
+import { SettingsService } from '../settings/settings.service.js';
 import {
   can,
+  formatXof,
   type AuthUser,
   type CashSessionClose,
   type CashSessionOpen,
@@ -19,7 +21,10 @@ type Db = PrismaService | Prisma.TransactionClient;
  */
 @Injectable()
 export class CashSessionsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly settings: SettingsService,
+  ) {}
 
   async current(user: AuthUser): Promise<CashSessionSummary | null> {
     const s = await this.prisma.cashSession.findFirst({
@@ -30,6 +35,10 @@ export class CashSessionsService {
   }
 
   async open(input: CashSessionOpen, user: AuthUser): Promise<CashSessionSummary> {
+    const { minOpeningFloat } = await this.settings.get();
+    if (input.openingFloat < minOpeningFloat) {
+      throw new BadRequestException(`Fond de caisse minimum : ${formatXof(minOpeningFloat)}`);
+    }
     const id = await this.prisma.$transaction(async (tx) => {
       // Sérialise les ouvertures d'un même utilisateur (double clic).
       await tx.$queryRaw`SELECT id FROM "User" WHERE id = ${user.id} FOR UPDATE`;

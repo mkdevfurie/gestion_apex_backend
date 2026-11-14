@@ -90,6 +90,19 @@ model Company {
   updatedAt DateTime @updatedAt
 }
 
+// Réglages de fonctionnement (une seule ligne, id = 1), modifiables par
+// l'administrateur. Appliqués par l'API, pas seulement affichés.
+model Settings {
+  id                      Int      @id @default(1)
+  defaultVatRate          Decimal  @default(18) @db.Decimal(5, 2) // TVA proposée pour un nouvel article
+  defaultAlertThreshold   Decimal  @default(5) @db.Decimal(14, 3) // seuil d'alerte proposé
+  maxDiscountRate         Decimal  @default(10) @db.Decimal(5, 2) // remise max par ligne (gérant)
+  cashDifferenceTolerance Int      @default(500) // écart de caisse toléré (FCFA)
+  minOpeningFloat         Int      @default(0) // fond de caisse minimum à l'ouverture
+  receiptFooter           String   @default("Merci de votre visite !")
+  updatedAt               DateTime @updatedAt
+}
+
 model Warehouse {
   id        String   @id @default(uuid(7))
   code      String   @unique // DEP-01, BTQ-01

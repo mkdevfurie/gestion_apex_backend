@@ -31,7 +31,7 @@ const session = (role: string) => ({
 
 describe('API (e2e)', () => {
   let app: INestApplication<App>;
-  const prisma = {
+  const prisma: Record<string, any> = {
     $queryRaw: vi.fn().mockResolvedValue([]),
     $transaction: vi.fn().mockResolvedValue([]),
     warehouse: { findMany: vi.fn().mockResolvedValue([]) },
@@ -45,7 +45,7 @@ describe('API (e2e)', () => {
     auditLog: { create: vi.fn() },
   };
   const as = (role: string) => {
-    prisma.session.findUnique.mockImplementation(({ where }) =>
+    prisma.session.findUnique.mockImplementation(({ where }: { where: { tokenHash: string } }) =>
       Promise.resolve(where.tokenHash === sha(TOKEN) ? session(role) : null),
     );
   };
@@ -152,6 +152,47 @@ describe('API (e2e)', () => {
       await http().post('/users').set(auth).send({ name: 'Moussa', email: 'm@test.sn', role: 'CASHIER' }).expect(403);
       as('CASHIER');
       await http().get('/users').set(auth).expect(403);
+    });
+
+    it('rapports et journal : réservés au gérant et à l’administrateur (403)', async () => {
+      const auth = { Authorization: `Bearer ${TOKEN}` };
+      for (const role of ['CASHIER', 'STOCK_KEEPER']) {
+        as(role);
+        for (const url of ['/reports/overview', '/reports/employees', '/reports/audit', '/reports/sales', '/reports/cash-sessions']) {
+          await http().get(url).set(auth).expect(403);
+        }
+      }
+    });
+
+    it('paramètres, société, dépôts : modifiables par l’administrateur seul (403)', async () => {
+      const auth = { Authorization: `Bearer ${TOKEN}` };
+      as('MANAGER');
+      await http().patch('/settings').set(auth).send({ maxDiscountRate: 50 }).expect(403);
+      await http().patch('/company').set(auth).send({ name: 'Pirate SARL' }).expect(403);
+      await http().post('/warehouses').set(auth).send({ code: 'X-01', name: 'Dépôt X' }).expect(403);
+    });
+
+    it('le caissier ne reçoit jamais les coûts d’achat (PMP, valorisation)', async () => {
+      as('CASHIER');
+      prisma.product = {
+        findMany: vi.fn().mockResolvedValue([
+          {
+            id: 'p1', sku: 'X', barcode: null, name: 'Article', category: null, unit: 'pièce', salePrice: 1000,
+            vatRate: { toNumber: () => 18 }, averageCost: 700, alertThreshold: { toNumber: () => 0 },
+            location: null, active: true, stockLevels: [{ quantity: { toNumber: () => 10 } }],
+          },
+        ]),
+      } as never;
+      prisma.stockMovement = { count: vi.fn().mockResolvedValue(0) } as never;
+      const res = await http().get('/products').set('Authorization', `Bearer ${TOKEN}`).expect(200);
+      expect(res.body.items[0].averageCost).toBe(0);
+      expect(res.body.summary.valuation).toBe(0);
+      expect(JSON.stringify(res.body)).not.toContain('700');
+    });
+
+    it('caisse : interdite au magasinier (403)', () => {
+      as('STOCK_KEEPER');
+      return http().get('/cash-sessions/current').set('Authorization', `Bearer ${TOKEN}`).expect(403);
     });
 
     it('GET /stock/movements refuse un type inconnu (400)', () => {
