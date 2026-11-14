@@ -1,0 +1,404 @@
+// Apex Ledger — schéma de données
+//
+// Règles métier fondamentales :
+// 1. Le stock n'est JAMAIS modifié directement : chaque variation est une ligne
+//    de `StockMovement` (immuable). `StockLevel` n'est qu'un cache recalculable.
+// 2. Une facture émise (status = ISSUED) est scellée : toute correction passe
+//    par un avoir (kind = CREDIT_NOTE).
+// 3. Créance = Invoice.total − Σ(Payment.amount). Aucune table "dette" séparée.
+//
+// Conventions :
+// - Montants en FCFA (XOF), entiers (le FCFA n'a pas de centimes).
+// - Quantités en Decimal(14,3) pour les ventes au mètre / au kilo.
+// - Taux (TVA, remise) en pourcentage Decimal(5,2) : 18.00 = 18 %.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ───────────────────────────── Utilisateurs ─────────────────────────────
+
+enum Role {
+  ADMIN // Gérant : tout, y compris paramètres et utilisateurs
+  MANAGER // Superviseur : ventes, achats, inventaire, rapports
+  CASHIER // Caissier / vendeur : caisse, encaissements
+  STOCK_KEEPER // Magasinier : réceptions, transferts, inventaires
+}
+
+model User {
+  id           String   @id @default(uuid(7))
+  email        String   @unique
+  name         String
+  passwordHash String
+  role         Role
+  active       Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  stockMovements     StockMovement[]
+  invoices           Invoice[]
+  purchases          Purchase[]
+  payments           Payment[]
+  cashSessionsOpened CashSession[]   @relation("OpenedBy")
+  cashSessionsClosed CashSession[]   @relation("ClosedBy")
+  auditLogs          AuditLog[]
+}
+
+// ───────────────────────────── Entreprise ─────────────────────────────
+
+// Une seule ligne : identité légale imprimée sur les factures.
+model Company {
+  id        Int      @id @default(1)
+  name      String
+  legalForm String? // SARL, SA, SUARL…
+  ninea     String?
+  rccm      String?
+  address   String?
+  phone     String?
+  email     String?
+  bankName  String?
+  iban      String?
+  currency  String   @default("XOF")
+  updatedAt DateTime @updatedAt
+}
+
+model Warehouse {
+  id        String   @id @default(uuid(7))
+  code      String   @unique // DEP-01, BTQ-01
+  name      String
+  address   String?
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  stockLevels    StockLevel[]
+  stockMovements StockMovement[]
+  invoices       Invoice[]
+  purchases      Purchase[]
+  cashSessions   CashSession[]
+}
+
+// ───────────────────────────── Catalogue ─────────────────────────────
+
+model Category {
+  id       String    @id @default(uuid(7))
+  name     String    @unique
+  products Product[]
+}
+
+model Product {
+  id             String   @id @default(uuid(7))
+  sku            String   @unique // CIM-50KG
+  barcode        String?  @unique // EAN-13
+  name           String
+  categoryId     String?
+  unit           String // sac 50kg, barre 12m, pièce, kg, m
+  salePrice      Int // prix de vente HT
+  vatRate        Decimal  @default(18) @db.Decimal(5, 2)
+  averageCost    Int      @default(0) // PMP, recalculé à chaque réception
+  alertThreshold Decimal  @default(0) @db.Decimal(14, 3)
+  location       String? // Allée A-04
+  active         Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  category       Category?       @relation(fields: [categoryId], references: [id])
+  stockLevels    StockLevel[]
+  stockMovements StockMovement[]
+  invoiceLines   InvoiceLine[]
+  purchaseLines  PurchaseLine[]
+
+  @@index([name])
+}
+
+// ───────────────────────────── Stock ─────────────────────────────
+
+enum MovementType {
+  // Entrées (+)
+  PURCHASE_RECEIPT
+  CUSTOMER_RETURN
+  ADJUSTMENT_IN
+  TRANSFER_IN
+  // Sorties (−)
+  SALE
+  LOSS // avarie, casse, vol
+  SUPPLIER_RETURN
+  ADJUSTMENT_OUT
+  TRANSFER_OUT
+}
+
+// Journal immuable : jamais d'UPDATE ni de DELETE.
+model StockMovement {
+  id            String       @id @default(uuid(7))
+  type          MovementType
+  productId     String
+  warehouseId   String
+  quantity      Decimal      @db.Decimal(14, 3) // signée : + entrée, − sortie
+  unitCost      Int // coût unitaire au moment du mouvement (valorisation)
+  balanceAfter  Decimal      @db.Decimal(14, 3) // solde du dépôt après mouvement
+  reason        String?
+  invoiceId     String?
+  purchaseId    String?
+  transferGroup String? // relie TRANSFER_OUT et TRANSFER_IN
+  userId        String
+  createdAt     DateTime     @default(now())
+
+  product   Product   @relation(fields: [productId], references: [id])
+  warehouse Warehouse @relation(fields: [warehouseId], references: [id])
+  invoice   Invoice?  @relation(fields: [invoiceId], references: [id])
+  purchase  Purchase? @relation(fields: [purchaseId], references: [id])
+  user      User      @relation(fields: [userId], references: [id])
+
+  @@index([productId, warehouseId, createdAt])
+  @@index([createdAt])
+}
+
+// Cache du stock courant par dépôt, mis à jour dans la même transaction
+// que le mouvement. Toujours recalculable depuis StockMovement.
+model StockLevel {
+  productId   String
+  warehouseId String
+  quantity    Decimal  @default(0) @db.Decimal(14, 3)
+  updatedAt   DateTime @updatedAt
+
+  product   Product   @relation(fields: [productId], references: [id])
+  warehouse Warehouse @relation(fields: [warehouseId], references: [id])
+
+  @@id([productId, warehouseId])
+}
+
+// ───────────────────────────── Tiers ─────────────────────────────
+
+model Customer {
+  id          String   @id @default(uuid(7))
+  code        String   @unique // CLI-BTP-088
+  name        String
+  phone       String?
+  email       String?
+  address     String?
+  ninea       String?
+  creditLimit Int      @default(0) // plafond d'encours autorisé
+  active      Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  invoices Invoice[]
+
+  @@index([name])
+  @@index([phone])
+}
+
+model Supplier {
+  id        String   @id @default(uuid(7))
+  code      String   @unique
+  name      String
+  phone     String?
+  email     String?
+  address   String?
+  ninea     String?
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  purchases Purchase[]
+
+  @@index([name])
+}
+
+// ───────────────────────────── Ventes ─────────────────────────────
+
+enum InvoiceKind {
+  QUOTE // devis / proforma : ne touche ni au stock ni aux créances
+  TICKET // vente comptoir (ticket 80 mm)
+  INVOICE // facture A4
+  CREDIT_NOTE // avoir : annule tout ou partie d'une facture
+}
+
+enum DocumentStatus {
+  DRAFT
+  ISSUED // scellé : plus aucune modification
+  CANCELLED // uniquement pour un brouillon ou un devis
+}
+
+model Invoice {
+  id            String         @id @default(uuid(7))
+  kind          InvoiceKind
+  status        DocumentStatus @default(DRAFT)
+  number        String?        @unique // attribué à l'émission : FAC-2025-0182
+  customerId    String? // null = client comptant anonyme
+  warehouseId   String
+  userId        String
+  issuedAt      DateTime?
+  dueDate       DateTime?
+  subtotal      Int            @default(0) // HT après remises de ligne
+  discount      Int            @default(0) // remise globale / escompte (sur HT)
+  vatTotal      Int            @default(0)
+  total         Int            @default(0) // TTC net à payer
+  notes         String?
+  sourceId      String? // devis converti, ou facture d'origine d'un avoir
+  hash          String? // empreinte SHA-256 chaînée (journal infalsifiable)
+  previousHash  String?
+  cashSessionId String?
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+
+  customer       Customer?       @relation(fields: [customerId], references: [id])
+  warehouse      Warehouse       @relation(fields: [warehouseId], references: [id])
+  user           User            @relation(fields: [userId], references: [id])
+  source         Invoice?        @relation("InvoiceSource", fields: [sourceId], references: [id])
+  derived        Invoice[]       @relation("InvoiceSource")
+  cashSession    CashSession?    @relation(fields: [cashSessionId], references: [id])
+  lines          InvoiceLine[]
+  payments       Payment[]
+  stockMovements StockMovement[]
+
+  @@index([customerId, status])
+  @@index([issuedAt])
+  @@index([dueDate])
+}
+
+model InvoiceLine {
+  id           String  @id @default(uuid(7))
+  invoiceId    String
+  productId    String?
+  description  String // copie figée de la désignation
+  quantity     Decimal @db.Decimal(14, 3)
+  unitPrice    Int // HT
+  discountRate Decimal @default(0) @db.Decimal(5, 2)
+  vatRate      Decimal @db.Decimal(5, 2)
+  lineTotal    Int // HT après remise
+  position     Int
+
+  invoice Invoice  @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  product Product? @relation(fields: [productId], references: [id])
+
+  @@index([invoiceId])
+}
+
+// ───────────────────────────── Achats ─────────────────────────────
+
+model Purchase {
+  id          String         @id @default(uuid(7))
+  status      DocumentStatus @default(DRAFT) // ISSUED = marchandise réceptionnée
+  number      String?        @unique // BR-2025-0119
+  supplierId  String
+  supplierRef String? // n° BL / facture fournisseur
+  warehouseId String
+  userId      String
+  receivedAt  DateTime?
+  dueDate     DateTime?
+  total       Int            @default(0)
+  notes       String?
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+
+  supplier       Supplier        @relation(fields: [supplierId], references: [id])
+  warehouse      Warehouse       @relation(fields: [warehouseId], references: [id])
+  user           User            @relation(fields: [userId], references: [id])
+  lines          PurchaseLine[]
+  payments       Payment[]
+  stockMovements StockMovement[]
+
+  @@index([supplierId, status])
+}
+
+model PurchaseLine {
+  id         String  @id @default(uuid(7))
+  purchaseId String
+  productId  String
+  quantity   Decimal @db.Decimal(14, 3)
+  unitCost   Int
+  lineTotal  Int
+  position   Int
+
+  purchase Purchase @relation(fields: [purchaseId], references: [id], onDelete: Cascade)
+  product  Product  @relation(fields: [productId], references: [id])
+
+  @@index([purchaseId])
+}
+
+// ───────────────────────────── Règlements & caisse ─────────────────────────────
+
+enum PaymentMethod {
+  CASH
+  WAVE
+  ORANGE_MONEY
+  FREE_MONEY
+  BANK_TRANSFER
+  CHEQUE
+  CARD
+}
+
+enum PaymentDirection {
+  IN // encaissement client
+  OUT // règlement fournisseur
+}
+
+// Immuable : une erreur se corrige par un règlement inverse.
+model Payment {
+  id            String           @id @default(uuid(7))
+  direction     PaymentDirection
+  method        PaymentMethod
+  amount        Int // positif ; négatif uniquement pour une contre-passation
+  reference     String? // n° chèque, ID transaction Wave/OM
+  invoiceId     String?
+  purchaseId    String?
+  cashSessionId String?
+  userId        String
+  receivedAt    DateTime         @default(now())
+
+  invoice     Invoice?     @relation(fields: [invoiceId], references: [id])
+  purchase    Purchase?    @relation(fields: [purchaseId], references: [id])
+  cashSession CashSession? @relation(fields: [cashSessionId], references: [id])
+  user        User         @relation(fields: [userId], references: [id])
+
+  @@index([invoiceId])
+  @@index([purchaseId])
+  @@index([receivedAt])
+}
+
+model CashSession {
+  id           String    @id @default(uuid(7))
+  warehouseId  String
+  openedById   String
+  openedAt     DateTime  @default(now())
+  openingFloat Int       @default(0) // fond de caisse
+  closedById   String?
+  closedAt     DateTime?
+  expectedCash Int? // calculé à la clôture (ticket Z)
+  countedCash  Int? // compté physiquement
+
+  warehouse Warehouse @relation(fields: [warehouseId], references: [id])
+  openedBy  User      @relation("OpenedBy", fields: [openedById], references: [id])
+  closedBy  User?     @relation("ClosedBy", fields: [closedById], references: [id])
+  invoices  Invoice[]
+  payments  Payment[]
+}
+
+// ───────────────────────────── Technique ─────────────────────────────
+
+// Numérotation séquentielle sans trou : verrouillée dans la transaction
+// d'émission (SELECT … FOR UPDATE). Clé ex. "FAC-2025", "TKT-2025", "BR-2025".
+model DocumentSequence {
+  key       String @id
+  lastValue Int    @default(0)
+}
+
+model AuditLog {
+  id        String   @id @default(uuid(7))
+  userId    String?
+  action    String // invoice.issue, stock.adjust, user.login…
+  entity    String
+  entityId  String?
+  data      Json?
+  createdAt DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id])
+
+  @@index([entity, entityId])
+  @@index([createdAt])
+}
