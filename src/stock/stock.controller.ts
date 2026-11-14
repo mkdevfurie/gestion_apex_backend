@@ -7,8 +7,10 @@ import {
   transferInputSchema,
   type InventoryCount,
   type MovementInput,
+  type AuthUser,
   type TransferInput,
 } from '../shared/index.js';
+import { CurrentUser, RequirePermission } from '../auth/auth.guard.js';
 import { StockService, type MovementQuery } from './stock.service.js';
 
 const movementQuerySchema = z.object({
@@ -31,18 +33,21 @@ export class StockController {
 
   /** Réception fournisseur, retour client, perte, retour fournisseur. */
   @Post('movements')
-  record(@Body({ schema: movementInputSchema }) body: MovementInput) {
-    return this.stock.record(body);
+  @RequirePermission('moveStock')
+  record(@Body({ schema: movementInputSchema }) body: MovementInput, @CurrentUser() user: AuthUser) {
+    return this.stock.record(body, user.id);
   }
 
   /** Comptage d'inventaire : crée l'ajustement de l'écart. */
   @Post('inventory')
-  inventory(@Body({ schema: inventoryCountSchema }) body: InventoryCount) {
-    return this.stock.inventory(body);
+  @RequirePermission('moveStock')
+  inventory(@Body({ schema: inventoryCountSchema }) body: InventoryCount, @CurrentUser() user: AuthUser) {
+    return this.stock.inventory(body, user.id);
   }
 
   @Post('transfers')
-  transfer(@Body({ schema: transferInputSchema }) body: TransferInput) {
-    return this.stock.transfer(body);
+  @RequirePermission('moveStock')
+  transfer(@Body({ schema: transferInputSchema }) body: TransferInput, @CurrentUser() user: AuthUser) {
+    return this.stock.transfer(body, user.id);
   }
 }

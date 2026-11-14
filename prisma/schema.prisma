@@ -37,9 +37,11 @@ model User {
   passwordHash String
   role         Role
   active       Boolean  @default(true)
+  lastLoginAt  DateTime?
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
+  sessions           Session[]
   stockMovements     StockMovement[]
   invoices           Invoice[]
   purchases          Purchase[]
@@ -47,6 +49,24 @@ model User {
   cashSessionsOpened CashSession[]   @relation("OpenedBy")
   cashSessionsClosed CashSession[]   @relation("ClosedBy")
   auditLogs          AuditLog[]
+}
+
+// Session de connexion. Le jeton (aléatoire, 256 bits) n'est jamais stocké :
+// seule son empreinte SHA-256 l'est. Supprimer la ligne = déconnecter.
+model Session {
+  id         String   @id @default(uuid(7))
+  userId     String
+  tokenHash  String   @unique
+  userAgent  String?
+  ip         String?
+  createdAt  DateTime @default(now())
+  lastUsedAt DateTime @default(now())
+  expiresAt  DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
 }
 
 // ───────────────────────────── Entreprise ─────────────────────────────

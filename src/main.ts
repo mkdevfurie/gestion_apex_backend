@@ -12,6 +12,9 @@ async function bootstrap() {
   const app = await NestFactory.create(AppModule);
   const config = app.get<ConfigService<Env, true>>(ConfigService);
 
+  // Derrière le proxy de Render : req.ip = adresse du client (limite de tentatives).
+  app.getHttpAdapter().getInstance().set('trust proxy', config.get('TRUST_PROXY', { infer: true }));
+
   app.setGlobalPrefix('api');
   // Valide @Body/@Query/@Param({ schema }) avec les schémas Zod partagés.
   app.useGlobalPipes(new StandardSchemaValidationPipe());

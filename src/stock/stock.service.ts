@@ -1,7 +1,6 @@
 import { ConflictException, Injectable, NotFoundException, ServiceUnavailableException } from '@nestjs/common';
 import { Prisma } from '../generated/prisma/client.js';
 import { movementInclude, toMovementRow } from '../catalog/mappers.js';
-import { CurrentUserService } from '../common/current-user.service.js';
 import { PrismaService } from '../prisma/prisma.service.js';
 import type {
   InventoryCount,
@@ -28,10 +27,7 @@ export type MovementQuery = {
 
 @Injectable()
 export class StockService {
-  constructor(
-    private readonly prisma: PrismaService,
-    private readonly currentUser: CurrentUserService,
-  ) {}
+  constructor(private readonly prisma: PrismaService) {}
 
   async movements(query: MovementQuery) {
     const where: Prisma.StockMovementWhereInput = {
@@ -52,8 +48,7 @@ export class StockService {
     return { items: rows.map(toMovementRow), total, page: query.page, pageSize: query.pageSize };
   }
 
-  async record(input: MovementInput): Promise<MovementRow> {
-    const userId = await this.currentUser.id();
+  async record(input: MovementInput, userId: string): Promise<MovementRow> {
     return this.run(async (tx) => {
       await this.assertWarehouse(tx, input.warehouseId);
       const m = await applyMovement(tx, { ...input, userId });
@@ -62,8 +57,7 @@ export class StockService {
     });
   }
 
-  async inventory(input: InventoryCount) {
-    const userId = await this.currentUser.id();
+  async inventory(input: InventoryCount, userId: string) {
     return this.run(async (tx) => {
       await this.assertWarehouse(tx, input.warehouseId);
       const { difference, movement } = await applyInventoryCount(tx, { ...input, userId });
@@ -74,8 +68,7 @@ export class StockService {
     });
   }
 
-  async transfer(input: TransferInput) {
-    const userId = await this.currentUser.id();
+  async transfer(input: TransferInput, userId: string) {
     return this.run(async (tx) => {
       await this.assertWarehouse(tx, input.fromWarehouseId);
       await this.assertWarehouse(tx, input.toWarehouseId);

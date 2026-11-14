@@ -18,6 +18,7 @@ pnpm install                  # génère aussi le client Prisma
 cp .env.example .env          # puis coller les URL Neon
 pnpm prisma:migrate           # crée / met à jour les tables
 pnpm db:seed                  # données de démo (2 dépôts, 13 articles, mouvements)
+pnpm user:create              # crée votre compte administrateur (mot de passe masqué)
 pnpm dev                      # http://localhost:3001/api/health
 ```
 
@@ -27,6 +28,7 @@ pnpm dev                      # http://localhost:3001/api/health
 | `DIRECT_URL`   | Connexion Neon directe, utilisée par `prisma migrate`             |
 | `PORT`         | Port HTTP (3001 par défaut)                                       |
 | `WEB_ORIGIN`   | Origines CORS autorisées, séparées par des virgules               |
+| `TRUST_PROXY`  | Nombre de proxys devant l'API (Render : 1, local : 0)             |
 
 ## Règles métier non négociables
 
@@ -37,6 +39,36 @@ pnpm dev                      # http://localhost:3001/api/health
 4. **Montants en FCFA entiers**, quantités en `Decimal(14,3)`.
 5. Les totaux sont calculés par `computeInvoiceTotals` (`src/shared`).
    L'escompte est déduit de la base HT **avant** la TVA.
+
+## Authentification
+
+- `POST /auth/login` → jeton de session (256 bits aléatoires). **Seule son
+  empreinte SHA-256 est stockée** (table `Session`) : supprimer la ligne
+  déconnecte. Expiration après 12 h d'inactivité.
+- Toutes les routes exigent `Authorization: Bearer <jeton>`, sauf `/health`
+  et `/auth/login` (garde globale `AuthGuard`).
+- Mots de passe : scrypt (N=2¹⁵), comparaison à temps constant ; même réponse
+  pour un e-mail inconnu, un mauvais mot de passe ou un compte désactivé.
+- 5 tentatives de connexion par minute et par IP (429 au-delà).
+- Rôles vérifiés côté API (`src/shared/roles.ts`, partagé avec les interfaces) :
+
+| Action                                   | Rôles                          |
+| ---------------------------------------- | ------------------------------ |
+| Lire catalogue, stock, journal           | tous les utilisateurs connectés |
+| Créer / modifier articles et catégories  | Administrateur, Gérant         |
+| Réceptions, pertes, inventaires, transferts | Administrateur, Gérant, Magasinier |
+| Dashboard d'administration               | Administrateur, Gérant         |
+
+Le compte de démo `admin@apex.local` créé par le seed n'a **pas** de mot de
+passe (connexion impossible). Créez le vôtre avec `pnpm user:create`, qui sert
+aussi à réinitialiser un mot de passe (et ferme les sessions ouvertes).
+
+## Déploiement (Render)
+
+- Commande de build : `pnpm install && pnpm build && pnpm exec prisma migrate deploy`
+- Commande de démarrage : `pnpm start:prod`
+- Variables : `DATABASE_URL`, `DIRECT_URL` (avec `sslmode=verify-full`),
+  `WEB_ORIGIN` (URL publiques du front et de l'admin), `TRUST_PROXY=1`.
 
 ## Endpoints (préfixe `/api`)
 
@@ -60,11 +92,10 @@ verrou `FOR UPDATE` sur l'article, refus du stock négatif (409), PMP recalculé
 transaction. Les ventes (`SALE`) ne se saisissent pas à la main : elles viendront
 de la caisse.
 
-> **Temporaire** : sans module d'authentification, les mouvements sont signés
-> par le premier administrateur (`admin@apex.local`, connexion désactivée).
-
 > **Neon** met la base en veille après quelques minutes d'inactivité : la
 > première requête peut prendre quelques secondes (transactions : `maxWait` 10 s).
+> L'API utilise le pilote `pg` (TCP) : les connexions inactives sont libérées
+> après 60 s, avant que Neon ne les coupe.
 
 ## Code partagé
 

@@ -12,6 +12,7 @@ import {
   type ProductUpdate,
   type Warehouse,
 } from '../shared/index.js';
+import { RequirePermission } from '../auth/auth.guard.js';
 import { ProductsService, type ProductQuery } from './products.service.js';
 
 const uuid = z.string().uuid();
@@ -52,6 +53,7 @@ export class CatalogController {
   }
 
   @Post('categories')
+  @RequirePermission('manageCatalog')
   async createCategory(@Body({ schema: categoryInputSchema }) body: { name: string }): Promise<Category> {
     try {
       const c = await this.prisma.category.create({ data: body });
@@ -78,11 +80,13 @@ export class CatalogController {
   }
 
   @Post('products')
+  @RequirePermission('manageCatalog')
   create(@Body({ schema: productInputSchema }) body: ProductInput) {
     return this.products.create(body);
   }
 
   @Patch('products/:id')
+  @RequirePermission('manageCatalog')
   update(@Param('id', { schema: uuid }) id: string, @Body({ schema: productUpdateSchema }) body: ProductUpdate) {
     return this.products.update(id, body);
   }

@@ -4,6 +4,8 @@ export const envSchema = z.object({
   DATABASE_URL: z.string().url(),
   DIRECT_URL: z.string().url().optional(),
   PORT: z.coerce.number().int().default(3001),
+  /** Nombre de proxys devant l'API (Render : 1). 0 en local. */
+  TRUST_PROXY: z.coerce.number().int().min(0).default(1),
   /** Origines autorisées (CORS), séparées par des virgules : front + admin. */
   WEB_ORIGIN: z
     .string()

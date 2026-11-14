@@ -1,18 +1,45 @@
+import { createHash } from 'node:crypto';
 import { Test, TestingModule } from '@nestjs/testing';
 import { INestApplication, StandardSchemaValidationPipe } from '@nestjs/common';
 import request from 'supertest';
 import { App } from 'supertest/types.js';
 import { AppModule } from './../src/app.module.js';
+import { hashPassword } from './../src/auth/password.js';
 import { PrismaService } from './../src/prisma/prisma.service.js';
 
-// Base simulée : ces tests couvrent le routage et la validation HTTP.
-// La logique de stock (verrou, PMP, soldes) est testée contre Neon.
+// Base simulée : ces tests couvrent le routage, l'authentification et la
+// validation HTTP. La logique de stock (verrou, PMP, soldes) est testée contre Neon.
+
+const TOKEN = 'jeton-de-test';
+const sha = (t: string) => createHash('sha256').update(t).digest('hex');
+const user = (role: string) => ({ id: 'u1', email: 'caisse@test.sn', name: 'Awa', role, active: true });
+const session = (role: string) => ({
+  id: 's1',
+  tokenHash: sha(TOKEN),
+  lastUsedAt: new Date(),
+  expiresAt: new Date(Date.now() + 3_600_000),
+  user: user(role),
+});
+
 describe('API (e2e)', () => {
   let app: INestApplication<App>;
   const prisma = {
     $queryRaw: vi.fn().mockResolvedValue([]),
-    $transaction: vi.fn(),
+    $transaction: vi.fn().mockResolvedValue([]),
     warehouse: { findMany: vi.fn().mockResolvedValue([]) },
+    session: {
+      findUnique: vi.fn(),
+      create: vi.fn(),
+      update: vi.fn(),
+      deleteMany: vi.fn().mockResolvedValue({ count: 1 }),
+    },
+    user: { findUnique: vi.fn(), update: vi.fn() },
+    auditLog: { create: vi.fn() },
+  };
+  const as = (role: string) => {
+    prisma.session.findUnique.mockImplementation(({ where }) =>
+      Promise.resolve(where.tokenHash === sha(TOKEN) ? session(role) : null),
+    );
   };
 
   beforeEach(async () => {
@@ -33,40 +60,117 @@ describe('API (e2e)', () => {
     vi.clearAllMocks();
   });
 
-  it('GET /health', () => {
-    return request(app.getHttpServer())
+  const http = () => request(app.getHttpServer());
+
+  it('GET /health est public', () => {
+    return http()
       .get('/health')
       .expect(200)
-      .expect((res) => {
-        expect(res.body).toMatchObject({ status: 'ok', database: 'up' });
-      });
+      .expect((res) => expect(res.body).toMatchObject({ status: 'ok', database: 'up' }));
   });
 
-  it('GET /warehouses', () => {
-    return request(app.getHttpServer()).get('/warehouses').expect(200).expect([]);
+  describe('protection des routes', () => {
+    it('refuse sans jeton (401)', () => {
+      return http().get('/warehouses').expect(401);
+    });
+
+    it('refuse un jeton inconnu (401)', () => {
+      as('CASHIER');
+      return http().get('/warehouses').set('Authorization', 'Bearer inconnu').expect(401);
+    });
+
+    it('refuse une session expirée (401)', () => {
+      prisma.session.findUnique.mockResolvedValue({ ...session('ADMIN'), expiresAt: new Date(Date.now() - 1) });
+      return http().get('/warehouses').set('Authorization', `Bearer ${TOKEN}`).expect(401);
+    });
+
+    it('refuse un compte désactivé (401)', () => {
+      prisma.session.findUnique.mockResolvedValue({ ...session('ADMIN'), user: { ...user('ADMIN'), active: false } });
+      return http().get('/warehouses').set('Authorization', `Bearer ${TOKEN}`).expect(401);
+    });
+
+    it('autorise la lecture à tout utilisateur connecté', () => {
+      as('CASHIER');
+      return http().get('/warehouses').set('Authorization', `Bearer ${TOKEN}`).expect(200).expect([]);
+    });
+
+    it('interdit à un caissier de saisir un mouvement de stock (403)', async () => {
+      as('CASHIER');
+      await http()
+        .post('/stock/movements')
+        .set('Authorization', `Bearer ${TOKEN}`)
+        .send({ type: 'LOSS', productId: '01a1d9f6-1e4b-7c4e-9a3b-2f1c8d7e6b5a', warehouseId: '01a1d9f6-1e4b-7c4e-9a3b-2f1c8d7e6b5b', quantity: 1 })
+        .expect(403);
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('interdit à un magasinier de créer un article (403)', () => {
+      as('STOCK_KEEPER');
+      return http()
+        .post('/products')
+        .set('Authorization', `Bearer ${TOKEN}`)
+        .send({ sku: 'X1', name: 'Article', unit: 'pièce', salePrice: 100 })
+        .expect(403);
+    });
+
+    it('valide le corps après le contrôle du rôle (400)', async () => {
+      as('STOCK_KEEPER');
+      await http()
+        .post('/stock/movements')
+        .set('Authorization', `Bearer ${TOKEN}`)
+        .send({ type: 'PURCHASE_RECEIPT', productId: '01a1d9f6-1e4b-7c4e-9a3b-2f1c8d7e6b5a', warehouseId: '01a1d9f6-1e4b-7c4e-9a3b-2f1c8d7e6b5b', quantity: 10 })
+        .expect(400)
+        .expect((res) => expect(res.body.message[0]).toContain('unitCost'));
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('GET /stock/movements refuse un type inconnu (400)', () => {
+      as('ADMIN');
+      return http().get('/stock/movements?type=VOL').set('Authorization', `Bearer ${TOKEN}`).expect(400);
+    });
   });
 
-  it('GET /products/:id refuse un identifiant invalide', () => {
-    return request(app.getHttpServer()).get('/products/abc').expect(400);
-  });
+  describe('POST /auth/login', () => {
+    it('ouvre une session avec le bon mot de passe', async () => {
+      prisma.user.findUnique.mockResolvedValue({ ...user('MANAGER'), passwordHash: await hashPassword('Rufisque2026') });
+      const res = await http().post('/auth/login').send({ email: ' Caisse@Test.sn ', password: 'Rufisque2026' }).expect(200);
+      expect(res.body.user).toEqual({ id: 'u1', email: 'caisse@test.sn', name: 'Awa', role: 'MANAGER' });
+      expect(res.body.token).toMatch(/^[\w-]{43}$/);
+      expect(prisma.user.findUnique).toHaveBeenCalledWith({ where: { email: 'caisse@test.sn' } });
+      // Seule l'empreinte du jeton est enregistrée.
+      expect(prisma.session.create).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ tokenHash: sha(res.body.token) }) }),
+      );
+      expect(JSON.stringify(prisma.session.create.mock.calls)).not.toContain(res.body.token);
+    });
 
-  it('POST /stock/movements refuse une réception sans coût, sans toucher la base', async () => {
-    await request(app.getHttpServer())
-      .post('/stock/movements')
-      .send({
-        type: 'PURCHASE_RECEIPT',
-        productId: '01a1d9f6-1e4b-7c4e-9a3b-2f1c8d7e6b5a',
-        warehouseId: '01a1d9f6-1e4b-7c4e-9a3b-2f1c8d7e6b5b',
-        quantity: 10,
-      })
-      .expect(400)
-      .expect((res) => {
-        expect(res.body.message[0]).toContain('unitCost');
-      });
-    expect(prisma.$transaction).not.toHaveBeenCalled();
-  });
+    it('même réponse pour un mauvais mot de passe et un e-mail inconnu', async () => {
+      prisma.user.findUnique.mockResolvedValueOnce({ ...user('ADMIN'), passwordHash: await hashPassword('Rufisque2026') });
+      const wrong = await http().post('/auth/login').send({ email: 'caisse@test.sn', password: 'mauvais' }).expect(401);
+      prisma.user.findUnique.mockResolvedValueOnce(null);
+      const unknown = await http().post('/auth/login').send({ email: 'x@test.sn', password: 'mauvais' }).expect(401);
+      expect(wrong.body.message).toBe('E-mail ou mot de passe incorrect');
+      expect(unknown.body.message).toBe(wrong.body.message);
+    });
 
-  it('GET /stock/movements refuse un type inconnu', () => {
-    return request(app.getHttpServer()).get('/stock/movements?type=VOL').expect(400);
+    it('refuse un compte désactivé même avec le bon mot de passe', async () => {
+      prisma.user.findUnique.mockResolvedValue({ ...user('ADMIN'), active: false, passwordHash: await hashPassword('Rufisque2026') });
+      await http().post('/auth/login').send({ email: 'caisse@test.sn', password: 'Rufisque2026' }).expect(401);
+      expect(prisma.session.create).not.toHaveBeenCalled();
+    });
+
+    it('limite les tentatives à 5 par minute (429)', async () => {
+      prisma.user.findUnique.mockResolvedValue(null);
+      for (let i = 0; i < 5; i++) {
+        await http().post('/auth/login').send({ email: 'x@test.sn', password: 'x' }).expect(401);
+      }
+      await http().post('/auth/login').send({ email: 'x@test.sn', password: 'x' }).expect(429);
+    });
+
+    it('déconnexion : supprime la session', async () => {
+      as('CASHIER');
+      await http().post('/auth/logout').set('Authorization', `Bearer ${TOKEN}`).expect(204);
+      expect(prisma.session.deleteMany).toHaveBeenCalledWith({ where: { tokenHash: sha(TOKEN) } });
+    });
   });
 });
