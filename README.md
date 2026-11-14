@@ -59,9 +59,24 @@ pnpm dev                      # http://localhost:3001/api/health
 | Réceptions, pertes, inventaires, transferts | Administrateur, Gérant, Magasinier |
 | Dashboard d'administration               | Administrateur, Gérant         |
 
-Le compte de démo `admin@apex.local` créé par le seed n'a **pas** de mot de
-passe (connexion impossible). Créez le vôtre avec `pnpm user:create`, qui sert
-aussi à réinitialiser un mot de passe (et ferme les sessions ouvertes).
+Comptes :
+
+- **Premier administrateur** : `pnpm user:create` (mot de passe choisi, saisi masqué).
+- **Employés** : créés par un administrateur dans le dashboard admin
+  (« Utilisateurs & rôles »). Un mot de passe **provisoire** est généré et
+  affiché une seule fois ; l'API bloque tout le reste tant qu'il n'est pas changé.
+- **Secours** (administrateur bloqué) : `pnpm user:reset-password <e-mail>`
+  donne un mot de passe provisoire et ferme les sessions.
+- Un compte n'est jamais supprimé, il est **désactivé** (déconnexion immédiate) ;
+  il reste toujours au moins un administrateur actif.
+
+| Méthode | Route                       | Rôle requis        |
+| ------- | --------------------------- | ------------------ |
+| GET     | `/users`                    | Administrateur, Gérant |
+| POST    | `/users`                    | Administrateur     |
+| PATCH   | `/users/:id`                | Administrateur (nom, rôle, actif) |
+| POST    | `/users/:id/reset-password` | Administrateur     |
+| POST    | `/auth/password`            | soi-même           |
 
 ## Déploiement (Render)
 

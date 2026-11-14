@@ -9,14 +9,14 @@
  */
 import 'dotenv/config';
 import { createInterface } from 'node:readline';
-import { createAdapter } from '../src/prisma/adapter.js';
+import { prismaOptions } from '../src/prisma/adapter.js';
 import { PrismaClient } from '../src/generated/prisma/client.js';
 import { hashPassword } from '../src/auth/password.js';
 import { loginInputSchema, newPasswordSchema, roleLabels, roleSchema } from '../src/shared/index.js';
 
 const url = process.env['DATABASE_URL'];
 if (!url) throw new Error('DATABASE_URL manquant (voir .env.example)');
-const prisma = new PrismaClient({ adapter: createAdapter(url) });
+const prisma = new PrismaClient(prismaOptions(url));
 
 type Rl = ReturnType<typeof createInterface> & { _writeToOutput?: (s: string) => void };
 
@@ -66,7 +66,7 @@ async function main() {
     const u = await tx.user.upsert({
       where: { email: email.data },
       create: { email: email.data, name, role, passwordHash },
-      update: { name, role, passwordHash, active: true },
+      update: { name, role, passwordHash, active: true, mustChangePassword: false },
     });
     await tx.session.deleteMany({ where: { userId: u.id } });
     await tx.auditLog.create({

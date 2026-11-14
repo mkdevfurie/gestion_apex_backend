@@ -12,7 +12,15 @@ import { PrismaService } from './../src/prisma/prisma.service.js';
 
 const TOKEN = 'jeton-de-test';
 const sha = (t: string) => createHash('sha256').update(t).digest('hex');
-const user = (role: string) => ({ id: 'u1', email: 'caisse@test.sn', name: 'Awa', role, active: true });
+const user = (role: string, extra: object = {}) => ({
+  id: 'u1',
+  email: 'caisse@test.sn',
+  name: 'Awa',
+  role,
+  active: true,
+  mustChangePassword: false,
+  ...extra,
+});
 const session = (role: string) => ({
   id: 's1',
   tokenHash: sha(TOKEN),
@@ -33,7 +41,7 @@ describe('API (e2e)', () => {
       update: vi.fn(),
       deleteMany: vi.fn().mockResolvedValue({ count: 1 }),
     },
-    user: { findUnique: vi.fn(), update: vi.fn() },
+    user: { findUnique: vi.fn(), findMany: vi.fn(), update: vi.fn() },
     auditLog: { create: vi.fn() },
   };
   const as = (role: string) => {
@@ -124,6 +132,28 @@ describe('API (e2e)', () => {
       expect(prisma.$transaction).not.toHaveBeenCalled();
     });
 
+    it('mot de passe provisoire : tout est bloqué sauf profil et déconnexion', async () => {
+      prisma.session.findUnique.mockResolvedValue({ ...session('ADMIN'), user: user('ADMIN', { mustChangePassword: true }) });
+      const auth = { Authorization: `Bearer ${TOKEN}` };
+      await http()
+        .get('/warehouses')
+        .set(auth)
+        .expect(403)
+        .expect((res) => expect(res.body.message).toContain('mot de passe provisoire'));
+      await http().get('/auth/me').set(auth).expect(200);
+      await http().post('/auth/logout').set(auth).expect(204);
+    });
+
+    it('comptes : le gérant consulte, seul l’administrateur crée', async () => {
+      as('MANAGER');
+      prisma.user.findMany.mockResolvedValue([]);
+      const auth = { Authorization: `Bearer ${TOKEN}` };
+      await http().get('/users').set(auth).expect(200);
+      await http().post('/users').set(auth).send({ name: 'Moussa', email: 'm@test.sn', role: 'CASHIER' }).expect(403);
+      as('CASHIER');
+      await http().get('/users').set(auth).expect(403);
+    });
+
     it('GET /stock/movements refuse un type inconnu (400)', () => {
       as('ADMIN');
       return http().get('/stock/movements?type=VOL').set('Authorization', `Bearer ${TOKEN}`).expect(400);
@@ -134,7 +164,7 @@ describe('API (e2e)', () => {
     it('ouvre une session avec le bon mot de passe', async () => {
       prisma.user.findUnique.mockResolvedValue({ ...user('MANAGER'), passwordHash: await hashPassword('Rufisque2026') });
       const res = await http().post('/auth/login').send({ email: ' Caisse@Test.sn ', password: 'Rufisque2026' }).expect(200);
-      expect(res.body.user).toEqual({ id: 'u1', email: 'caisse@test.sn', name: 'Awa', role: 'MANAGER' });
+      expect(res.body.user).toEqual({ id: 'u1', email: 'caisse@test.sn', name: 'Awa', role: 'MANAGER', mustChangePassword: false });
       expect(res.body.token).toMatch(/^[\w-]{43}$/);
       expect(prisma.user.findUnique).toHaveBeenCalledWith({ where: { email: 'caisse@test.sn' } });
       // Seule l'empreinte du jeton est enregistrée.

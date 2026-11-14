@@ -1,8 +1,8 @@
-import { Injectable, UnauthorizedException } from '@nestjs/common';
+import { BadRequestException, Injectable, UnauthorizedException } from '@nestjs/common';
 import { createHash, randomBytes } from 'node:crypto';
 import { PrismaService } from '../prisma/prisma.service.js';
-import type { AuthUser, LoginInput, LoginResponse } from '../shared/index.js';
-import { dummyHash, verifyPassword } from './password.js';
+import type { AuthUser, ChangePasswordInput, LoginInput, LoginResponse } from '../shared/index.js';
+import { dummyHash, hashPassword, verifyPassword } from './password.js';
 
 /** Déconnexion après 12 h sans activité (une journée de travail). */
 const SESSION_IDLE_MS = 12 * 60 * 60 * 1000;
@@ -74,8 +74,29 @@ export class AuthService {
   async logout(token: string): Promise<void> {
     await this.prisma.session.deleteMany({ where: { tokenHash: sha256(token) } });
   }
+
+  /**
+   * Changement par l'utilisateur lui-même (obligatoire après un mot de passe
+   * provisoire). Ferme toutes ses AUTRES sessions : un appareil oublié ou un
+   * mot de passe connu d'un tiers ne donne plus accès.
+   */
+  async changePassword(userId: string, currentToken: string, input: ChangePasswordInput): Promise<AuthUser> {
+    const user = await this.prisma.user.findUniqueOrThrow({ where: { id: userId } });
+    if (!(await verifyPassword(input.currentPassword, user.passwordHash))) {
+      throw new BadRequestException('Mot de passe actuel incorrect');
+    }
+    const passwordHash = await hashPassword(input.newPassword);
+    const [updated] = await this.prisma.$transaction([
+      this.prisma.user.update({ where: { id: userId }, data: { passwordHash, mustChangePassword: false } }),
+      this.prisma.session.deleteMany({ where: { userId, tokenHash: { not: sha256(currentToken) } } }),
+      this.prisma.auditLog.create({
+        data: { userId, action: 'auth.password_change', entity: 'User', entityId: userId },
+      }),
+    ]);
+    return toAuthUser(updated);
+  }
 }
 
-function toAuthUser(u: { id: string; email: string; name: string; role: AuthUser['role'] }): AuthUser {
-  return { id: u.id, email: u.email, name: u.name, role: u.role };
+function toAuthUser(u: AuthUser): AuthUser {
+  return { id: u.id, email: u.email, name: u.name, role: u.role, mustChangePassword: u.mustChangePassword };
 }

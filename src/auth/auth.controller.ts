@@ -1,8 +1,14 @@
 import { Body, Controller, Get, HttpCode, Post, Req, UseGuards } from '@nestjs/common';
 import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
-import { loginInputSchema, type AuthUser, type LoginInput } from '../shared/index.js';
+import {
+  changePasswordSchema,
+  loginInputSchema,
+  type AuthUser,
+  type ChangePasswordInput,
+  type LoginInput,
+} from '../shared/index.js';
 import { AuthService } from './auth.service.js';
-import { CurrentUser, Public, type AuthedRequest } from './auth.guard.js';
+import { AllowPendingPassword, CurrentUser, Public, type AuthedRequest } from './auth.guard.js';
 
 @Controller('auth')
 export class AuthController {
@@ -19,13 +25,29 @@ export class AuthController {
   }
 
   @Post('logout')
+  @AllowPendingPassword()
   @HttpCode(204)
   async logout(@Req() req: AuthedRequest): Promise<void> {
     if (req.token) await this.auth.logout(req.token);
   }
 
   @Get('me')
+  @AllowPendingPassword()
   me(@CurrentUser() user: AuthUser): AuthUser {
     return user;
+  }
+
+  /** 10 essais par minute : le mot de passe actuel ne doit pas pouvoir être deviné ici. */
+  @Post('password')
+  @AllowPendingPassword()
+  @UseGuards(ThrottlerGuard)
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  @HttpCode(200)
+  changePassword(
+    @Body({ schema: changePasswordSchema }) body: ChangePasswordInput,
+    @CurrentUser() user: AuthUser,
+    @Req() req: AuthedRequest,
+  ): Promise<AuthUser> {
+    return this.auth.changePassword(user.id, req.token!, body);
   }
 }

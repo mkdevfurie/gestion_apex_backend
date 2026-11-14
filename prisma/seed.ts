@@ -6,13 +6,13 @@
  * pertes, transfert) via applyMovement : le journal et le PMP sont cohérents.
  */
 import 'dotenv/config';
-import { createAdapter } from '../src/prisma/adapter.js';
+import { prismaOptions } from '../src/prisma/adapter.js';
 import { PrismaClient } from '../src/generated/prisma/client.js';
 import { applyMovement, applyTransfer } from '../src/stock/apply-movement.js';
 
 const url = process.env['DATABASE_URL'];
 if (!url) throw new Error('DATABASE_URL manquant (voir .env.example)');
-const prisma = new PrismaClient({ adapter: createAdapter(url) });
+const prisma = new PrismaClient(prismaOptions(url));
 
 type Seed = {
   sku: string;

@@ -1,4 +1,4 @@
-import { randomBytes, scrypt as scryptCb, timingSafeEqual, type ScryptOptions } from 'node:crypto';
+import { randomBytes, randomInt, scrypt as scryptCb, timingSafeEqual, type ScryptOptions } from 'node:crypto';
 
 // scrypt (natif Node, aucune dépendance compilée) : N=2^15, r=8, p=1 ≈ 32 Mio par calcul.
 const N = 32_768;
@@ -41,3 +41,15 @@ export async function verifyPassword(password: string, stored: string): Promise<
  */
 let dummy: Promise<string> | undefined;
 export const dummyHash = () => (dummy ??= hashPassword(randomBytes(16).toString('hex')));
+
+// Sans caractères ambigus (0/O, 1/l/I) : il sera dicté ou recopié à la main.
+const ALPHABET = 'abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+
+/** Mot de passe provisoire lisible, ex. « Kq7m-3Hxp-9Rtd » (≈ 69 bits). */
+export function generateTemporaryPassword(): string {
+  for (;;) {
+    const chars = Array.from({ length: 12 }, () => ALPHABET[randomInt(ALPHABET.length)]);
+    const pwd = `${chars.slice(0, 4).join('')}-${chars.slice(4, 8).join('')}-${chars.slice(8).join('')}`;
+    if (/[a-zA-Z]/.test(pwd) && /\d/.test(pwd)) return pwd;
+  }
+}

@@ -24,7 +24,8 @@
     "prisma:studio": "prisma studio",
     "postinstall": "prisma generate",
     "db:seed": "tsx prisma/seed.ts",
-    "user:create": "tsx scripts/create-user.ts"
+    "user:create": "tsx scripts/create-user.ts",
+    "user:reset-password": "tsx scripts/reset-password.ts"
   },
   "dependencies": {
     "@nestjs/common": "^12.0.1",

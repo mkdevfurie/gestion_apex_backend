@@ -14,11 +14,18 @@ import { AuthService } from './auth.service.js';
 
 const PUBLIC = 'auth:public';
 const PERMISSION = 'auth:permission';
+const PENDING_PASSWORD_OK = 'auth:pending-password-ok';
 
 /** Route accessible sans connexion (santé, login). Tout le reste est protégé. */
 export const Public = () => SetMetadata(PUBLIC, true);
 
-/** Restreint la route aux rôles de la permission (voir shared/auth.ts). */
+/**
+ * Route utilisable avec un mot de passe provisoire (profil, changement de mot
+ * de passe, déconnexion). Toutes les autres sont bloquées tant qu'il n'est pas changé.
+ */
+export const AllowPendingPassword = () => SetMetadata(PENDING_PASSWORD_OK, true);
+
+/** Restreint la route aux rôles de la permission (voir shared/roles.ts). */
 export const RequirePermission = (p: Permission) => SetMetadata(PERMISSION, p);
 
 export type AuthedRequest = Request & { user?: AuthUser; token?: string };
@@ -51,6 +58,10 @@ export class AuthGuard implements CanActivate {
     if (!token) throw new UnauthorizedException('Connexion requise');
     req.user = await this.auth.authenticate(token);
     req.token = token;
+
+    if (req.user.mustChangePassword && !this.reflector.getAllAndOverride<boolean>(PENDING_PASSWORD_OK, targets)) {
+      throw new ForbiddenException('Changez votre mot de passe provisoire pour continuer');
+    }
 
     const permission = this.reflector.getAllAndOverride<Permission | undefined>(PERMISSION, targets);
     if (permission && !(permissions[permission] as readonly string[]).includes(req.user.role)) {

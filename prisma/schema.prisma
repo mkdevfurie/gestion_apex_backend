@@ -37,6 +37,9 @@ model User {
   passwordHash String
   role         Role
   active       Boolean  @default(true)
+  // Mot de passe provisoire (créé / réinitialisé par un administrateur) :
+  // l'utilisateur doit le changer avant de pouvoir faire quoi que ce soit.
+  mustChangePassword Boolean   @default(false)
   lastLoginAt  DateTime?
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
