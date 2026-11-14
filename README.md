@@ -81,6 +81,7 @@ Comptes :
 ## Déploiement (Render)
 
 - Commande de build : `pnpm install && pnpm build && pnpm exec prisma migrate deploy`
+  (`pnpm build` génère lui-même le client Prisma, ignoré par git)
 - Commande de démarrage : `pnpm start:prod`
 - Variables : `DATABASE_URL`, `DIRECT_URL` (avec `sslmode=verify-full`),
   `WEB_ORIGIN` (URL publiques du front et de l'admin), `TRUST_PROXY=1`.
