@@ -220,12 +220,29 @@ describe('API (e2e)', () => {
       const wrong = await http().post('/auth/login').send({ email: 'caisse@test.sn', password: 'mauvais' }).expect(401);
       prisma.user.findUnique.mockResolvedValueOnce(null);
       const unknown = await http().post('/auth/login').send({ email: 'x@test.sn', password: 'mauvais' }).expect(401);
-      expect(wrong.body.message).toBe('E-mail ou mot de passe incorrect');
+      expect(wrong.body.message).toContain('E-mail ou mot de passe incorrect');
       expect(unknown.body.message).toBe(wrong.body.message);
     });
 
     it('refuse un compte désactivé même avec le bon mot de passe', async () => {
       prisma.user.findUnique.mockResolvedValue({ ...user('ADMIN'), active: false, passwordHash: await hashPassword('Rufisque2026') });
+      await http().post('/auth/login').send({ email: 'caisse@test.sn', password: 'Rufisque2026' }).expect(401);
+      expect(prisma.session.create).not.toHaveBeenCalled();
+    });
+
+    it('verrouille le compte au 8e échec consécutif, même depuis plusieurs adresses', async () => {
+      prisma.user.findUnique.mockResolvedValue({ ...user('CASHIER'), failedLogins: 7, lockedUntil: null, passwordHash: await hashPassword('Rufisque2026') });
+      prisma.$transaction.mockImplementation((ops: unknown) => (Array.isArray(ops) ? Promise.resolve([]) : Promise.resolve()));
+      await http().post('/auth/login').send({ email: 'caisse@test.sn', password: 'mauvais' }).expect(401);
+      const update = prisma.user.update.mock.calls.at(-1)?.[0];
+      expect(update.data.failedLogins).toBe(0);
+      expect(update.data.lockedUntil.getTime()).toBeGreaterThan(Date.now() + 14 * 60_000);
+    });
+
+    it('compte verrouillé : refusé même avec le bon mot de passe', async () => {
+      prisma.user.findUnique.mockResolvedValue({
+        ...user('CASHIER'), failedLogins: 0, lockedUntil: new Date(Date.now() + 600_000), passwordHash: await hashPassword('Rufisque2026'),
+      });
       await http().post('/auth/login').send({ email: 'caisse@test.sn', password: 'Rufisque2026' }).expect(401);
       expect(prisma.session.create).not.toHaveBeenCalled();
     });

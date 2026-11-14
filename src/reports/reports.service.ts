@@ -32,7 +32,7 @@ export function resolvePeriod(p: Period): { start: Date; end: Date; from: string
 }
 
 const ticketWhere = (start: Date, end: Date): Prisma.InvoiceWhereInput => ({
-  kind: 'TICKET',
+  kind: { in: ['TICKET', 'INVOICE'] },
   status: 'ISSUED',
   issuedAt: { gte: start, lt: end },
 });
@@ -59,7 +59,7 @@ export class ReportsService {
         SELECT COALESCE(SUM(-m.quantity * m."unitCost"), 0) AS cost
         FROM "StockMovement" m
         JOIN "Invoice" i ON i.id = m."invoiceId"
-        WHERE m.type = 'SALE' AND i.kind = 'TICKET' AND i.status = 'ISSUED'
+        WHERE m.type IN ('SALE', 'CUSTOMER_RETURN') AND i.kind IN ('TICKET', 'INVOICE', 'CREDIT_NOTE') AND i.status = 'ISSUED'
           AND i."issuedAt" >= ${start} AND i."issuedAt" < ${end}`,
       this.prisma.$queryRaw<{ averageCost: number; alertThreshold: unknown; qty: unknown }[]>`
         SELECT p."averageCost", p."alertThreshold", COALESCE(SUM(sl.quantity), 0) AS qty
@@ -76,14 +76,20 @@ export class ReportsService {
         select: { userId: true },
       }),
       this.prisma.payment.groupBy({
-        by: ['method'],
-        where: { direction: 'IN', receivedAt: { gte: start, lt: end } },
+        by: ['method', 'direction'],
+        where: { receivedAt: { gte: start, lt: end }, method: { not: 'CREDIT_NOTE' }, purchaseId: null },
         _sum: { amount: true },
       }),
     ]);
+    const credits = await this.prisma.invoice.aggregate({
+      where: { kind: 'CREDIT_NOTE', status: 'ISSUED', issuedAt: { gte: start, lt: end } },
+      _sum: { total: true, subtotal: true, discount: true },
+    });
 
-    const salesTotal = sales._sum.total ?? 0;
-    const salesHt = (sales._sum.subtotal ?? 0) - (sales._sum.discount ?? 0);
+    // Chiffre d'affaires net des avoirs (retours clients).
+    const salesTotal = (sales._sum.total ?? 0) - (credits._sum.total ?? 0);
+    const salesHt =
+      (sales._sum.subtotal ?? 0) - (sales._sum.discount ?? 0) - ((credits._sum.subtotal ?? 0) - (credits._sum.discount ?? 0));
     const grossMargin = Math.round(salesHt - num(cost[0]?.cost));
     let stockValuation = 0;
     let low = 0;
@@ -112,8 +118,14 @@ export class ReportsService {
       cashAlerts: diffs.filter((d) => Math.abs(d) > cashDifferenceTolerance).length,
       cashDifferenceTotal: diffs.reduce((a, d) => a + d, 0),
       activeUsers: activeUsers.length,
-      byMethod: methods
-        .map((m) => ({ method: m.method as PaymentMethod, amount: m._sum.amount ?? 0 }))
+      byMethod: [
+        ...methods.reduce((acc, m) => {
+          const k = m.method as PaymentMethod;
+          acc.set(k, (acc.get(k) ?? 0) + (m.direction === 'IN' ? 1 : -1) * (m._sum.amount ?? 0));
+          return acc;
+        }, new Map<PaymentMethod, number>()),
+      ]
+        .map(([method, amount]) => ({ method, amount }))
         .sort((a, b) => b.amount - a.amount),
     };
   }
@@ -127,7 +139,7 @@ export class ReportsService {
       FROM generate_series(${start}::date, ${end}::date, interval '1 day') AS d
       LEFT JOIN "Invoice" i
         ON i."issuedAt" >= d AND i."issuedAt" < d + interval '1 day'
-       AND i.kind = 'TICKET' AND i.status = 'ISSUED'
+       AND i.kind IN ('TICKET', 'INVOICE') AND i.status = 'ISSUED'
       GROUP BY d ORDER BY d`;
     return rows.map((r) => ({ day: isoDay(new Date(r.day)), total: num(r.total), tickets: num(r.tickets) }));
   }
@@ -146,7 +158,7 @@ export class ReportsService {
       this.prisma.$queryRaw<{ userId: string; discount: unknown }[]>`
         SELECT i."userId", COALESCE(SUM(ROUND(l.quantity * l."unitPrice") - l."lineTotal"), 0) AS discount
         FROM "InvoiceLine" l JOIN "Invoice" i ON i.id = l."invoiceId"
-        WHERE i.kind = 'TICKET' AND i.status = 'ISSUED' AND i."issuedAt" >= ${start} AND i."issuedAt" < ${end}
+        WHERE i.kind IN ('TICKET', 'INVOICE') AND i.status = 'ISSUED' AND i."issuedAt" >= ${start} AND i."issuedAt" < ${end}
         GROUP BY i."userId"`,
       this.prisma.cashSession.findMany({
         where: { openedAt: { gte: start, lt: end } },
@@ -201,7 +213,7 @@ export class ReportsService {
       FROM "InvoiceLine" l
       JOIN "Invoice" i ON i.id = l."invoiceId"
       JOIN "Product" p ON p.id = l."productId"
-      WHERE i.kind = 'TICKET' AND i.status = 'ISSUED' AND i."issuedAt" >= ${start} AND i."issuedAt" < ${end}
+      WHERE i.kind IN ('TICKET', 'INVOICE') AND i.status = 'ISSUED' AND i."issuedAt" >= ${start} AND i."issuedAt" < ${end}
       GROUP BY l."productId", p.sku, p.name, p.unit
       ORDER BY revenue DESC
       LIMIT ${limit}`;
@@ -279,7 +291,7 @@ export class ReportsService {
         include: {
           warehouse: { select: { code: true } },
           openedBy: { select: { id: true, name: true } },
-          invoices: { where: { status: 'ISSUED', kind: 'TICKET' }, select: { total: true } },
+          invoices: { where: { status: 'ISSUED', kind: { in: ['TICKET', 'INVOICE'] } }, select: { total: true } },
         },
         orderBy: { openedAt: 'desc' },
         take,
@@ -318,7 +330,7 @@ export class ReportsService {
     page: number;
     pageSize: number;
   }): Promise<Paged<SaleRow>> {
-    const where: Prisma.InvoiceWhereInput = { kind: 'TICKET', status: 'ISSUED', userId: q.userId };
+    const where: Prisma.InvoiceWhereInput = { kind: { in: ['TICKET', 'INVOICE'] }, status: 'ISSUED', userId: q.userId };
     if (q.q) where.number = { contains: q.q.trim().toUpperCase() };
     if (q.from || q.to) {
       const { start, end } = resolvePeriod(q);

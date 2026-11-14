@@ -1,9 +1,11 @@
-import { ConflictException, Injectable, NotFoundException, ServiceUnavailableException } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, NotFoundException, ServiceUnavailableException } from '@nestjs/common';
 import { Prisma } from '../generated/prisma/client.js';
 import { movementInclude, toMovementRow } from '../catalog/mappers.js';
 import { PrismaService } from '../prisma/prisma.service.js';
 import type {
+  InventoryBatch,
   InventoryCount,
+  InventoryReport,
   MovementInput,
   MovementRow,
   MovementType,
@@ -68,6 +70,50 @@ export class StockService {
     });
   }
 
+  /**
+   * Inventaire complet d'un dépôt : un ajustement par écart, tout ou rien.
+   * Les articles non comptés ne sont pas touchés.
+   */
+  async inventoryBatch(input: InventoryBatch, userId: string): Promise<InventoryReport> {
+    if (new Set(input.counts.map((c) => c.productId)).size !== input.counts.length) {
+      throw new BadRequestException('Un article est compté deux fois');
+    }
+    return this.run(async (tx) => {
+      await this.assertWarehouse(tx, input.warehouseId);
+      const products = await tx.product.findMany({
+        where: { id: { in: input.counts.map((c) => c.productId) } },
+        select: { id: true, sku: true, name: true, averageCost: true },
+      });
+      const byId = new Map(products.map((p) => [p.id, p]));
+      if (byId.size !== input.counts.length) throw new NotFoundException('Article introuvable');
+      const report: InventoryReport = { adjusted: 0, unchanged: 0, valueDifference: 0, lines: [] };
+      for (const c of [...input.counts].sort((a, b) => a.productId.localeCompare(b.productId))) {
+        const { difference } = await applyInventoryCount(tx, {
+          productId: c.productId,
+          warehouseId: input.warehouseId,
+          countedQuantity: c.countedQuantity,
+          reason: input.reason ?? 'Inventaire complet',
+          userId,
+        });
+        const p = byId.get(c.productId)!;
+        if (difference === 0) report.unchanged++;
+        else {
+          report.adjusted++;
+          report.valueDifference += Math.round(difference * p.averageCost);
+        }
+        report.lines.push({ productId: p.id, sku: p.sku, name: p.name, before: c.countedQuantity - difference, counted: c.countedQuantity, difference });
+      }
+      await this.audit(tx, userId, 'stock.inventory_batch', input.warehouseId, {
+        warehouseId: input.warehouseId,
+        adjusted: report.adjusted,
+        unchanged: report.unchanged,
+        valueDifference: report.valueDifference,
+      });
+      report.lines.sort((a, b) => Math.abs(b.difference) - Math.abs(a.difference));
+      return report;
+    }, 120_000);
+  }
+
   async transfer(input: TransferInput, userId: string) {
     return this.run(async (tx) => {
       await this.assertWarehouse(tx, input.fromWarehouseId);
@@ -82,11 +128,11 @@ export class StockService {
   }
 
   /** Transaction + traduction des erreurs métier en réponses HTTP. */
-  private async run<T>(fn: (tx: Prisma.TransactionClient) => Promise<T>): Promise<T> {
+  private async run<T>(fn: (tx: Prisma.TransactionClient) => Promise<T>, timeout = 15_000): Promise<T> {
     try {
       // maxWait : Neon met la base en veille après quelques minutes d'inactivité ;
       // le réveil dépasse souvent les 2 s accordées par défaut pour ouvrir la transaction.
-      return await this.prisma.$transaction(fn, { maxWait: 10_000, timeout: 15_000 });
+      return await this.prisma.$transaction(fn, { maxWait: 10_000, timeout });
     } catch (e) {
       if (e instanceof InsufficientStockError) throw new ConflictException(e.message);
       if (e instanceof ProductNotFoundError) throw new NotFoundException(e.message);

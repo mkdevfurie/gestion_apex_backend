@@ -2,10 +2,12 @@ import { Body, Controller, Get, Post, Query } from '@nestjs/common';
 import { z } from 'zod';
 import {
   can,
+  inventoryBatchSchema,
   inventoryCountSchema,
   movementInputSchema,
   movementTypeSchema,
   transferInputSchema,
+  type InventoryBatch,
   type InventoryCount,
   type MovementInput,
   type AuthUser,
@@ -46,6 +48,13 @@ export class StockController {
   @RequirePermission('moveStock')
   inventory(@Body({ schema: inventoryCountSchema }) body: InventoryCount, @CurrentUser() user: AuthUser) {
     return this.stock.inventory(body, user.id);
+  }
+
+  /** Inventaire complet (plusieurs articles) : un seul enregistrement, tout ou rien. */
+  @Post('inventory/batch')
+  @RequirePermission('moveStock')
+  inventoryBatch(@Body({ schema: inventoryBatchSchema }) body: InventoryBatch, @CurrentUser() user: AuthUser) {
+    return this.stock.inventoryBatch(body, user.id);
   }
 
   @Post('transfers')

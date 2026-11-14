@@ -34,6 +34,9 @@ export class SettingsService {
           cashDifferenceTolerance: row.cashDifferenceTolerance,
           minOpeningFloat: row.minOpeningFloat,
           receiptFooter: row.receiptFooter,
+          paymentTermDays: row.paymentTermDays,
+          quoteValidityDays: row.quoteValidityDays,
+          cashierCanSellOnCredit: row.cashierCanSellOnCredit,
         }
       : defaultSettings;
     this.cache = { value, at: Date.now() };

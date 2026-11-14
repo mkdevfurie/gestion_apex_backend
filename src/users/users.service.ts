@@ -107,12 +107,25 @@ export class UsersService {
     const user = await this.prisma.$transaction(async (tx) => {
       const exists = await tx.user.findUnique({ where: { id }, select: { id: true } });
       if (!exists) throw new NotFoundException('Compte introuvable');
-      const u = await tx.user.update({ where: { id }, data: { passwordHash, mustChangePassword: true }, select });
+      const u = await tx.user.update({
+        where: { id },
+        data: { passwordHash, mustChangePassword: true, failedLogins: 0, lockedUntil: null },
+        select,
+      });
       await tx.session.deleteMany({ where: { userId: id } });
       await this.audit(tx, actor, 'user.password_reset', id, {});
       return u;
     });
     return { user: toRow(user), temporaryPassword };
+  }
+
+  /** Déconnecte immédiatement tous les appareils d'un employé. */
+  async revokeSessions(id: string, actor: AuthUser) {
+    const { count } = await this.prisma.session.deleteMany({ where: { userId: id } });
+    await this.prisma.auditLog.create({
+      data: { userId: actor.id, action: 'auth.session_revoke', entity: 'User', entityId: id, data: { count } },
+    });
+    return { revoked: count };
   }
 
   private audit(tx: Prisma.TransactionClient, actor: AuthUser, action: string, entityId: string, data: object) {

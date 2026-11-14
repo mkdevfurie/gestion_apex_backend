@@ -1,5 +1,6 @@
-import { Body, Controller, Get, HttpCode, Post, Req, UseGuards } from '@nestjs/common';
-import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
+import { Body, Controller, Delete, Get, HttpCode, Param, Post, Req } from '@nestjs/common';
+import { z } from 'zod';
+import { Throttle } from '@nestjs/throttler';
 import {
   changePasswordSchema,
   loginInputSchema,
@@ -16,7 +17,6 @@ export class AuthController {
 
   /** 5 essais par minute et par adresse IP (anti force brute). */
   @Public()
-  @UseGuards(ThrottlerGuard)
   @Throttle({ default: { limit: 5, ttl: 60_000 } })
   @Post('login')
   @HttpCode(200)
@@ -37,10 +37,19 @@ export class AuthController {
     return user;
   }
 
+  @Get('sessions')
+  sessions(@CurrentUser() user: AuthUser, @Req() req: AuthedRequest) {
+    return this.auth.sessions(user.id, req.token!);
+  }
+
+  @Delete('sessions/:id')
+  revoke(@Param('id', { schema: z.string().uuid() }) id: string, @CurrentUser() user: AuthUser) {
+    return this.auth.revokeSession(user.id, id);
+  }
+
   /** 10 essais par minute : le mot de passe actuel ne doit pas pouvoir être deviné ici. */
   @Post('password')
   @AllowPendingPassword()
-  @UseGuards(ThrottlerGuard)
   @Throttle({ default: { limit: 10, ttl: 60_000 } })
   @HttpCode(200)
   changePassword(

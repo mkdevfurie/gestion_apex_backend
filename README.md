@@ -78,13 +78,10 @@ Comptes :
 | POST    | `/users/:id/reset-password` | Administrateur     |
 | POST    | `/auth/password`            | soi-même           |
 
-## Déploiement (Render)
+## Déploiement
 
-- Commande de build : `pnpm install && pnpm build && pnpm exec prisma migrate deploy`
-  (`pnpm build` génère lui-même le client Prisma, ignoré par git)
-- Commande de démarrage : `pnpm start:prod`
-- Variables : `DATABASE_URL`, `DIRECT_URL` (avec `sslmode=verify-full`),
-  `WEB_ORIGIN` (URL publiques du front et de l'admin), `TRUST_PROXY=1`.
+Voir **[PRODUCTION.md](PRODUCTION.md)** : Neon (branche dev, sauvegardes),
+Render (plan, variables, migrations), premier démarrage, sécurité, routine.
 
 ## Endpoints (préfixe `/api`)
 
@@ -131,6 +128,27 @@ répartis par `settlePayments` (partagé avec la caisse) : mobile money au monta
 exact, monnaie rendue uniquement sur les espèces, ticket soldé obligatoire.
 `clientRequestId` rend l'encaissement idempotent (double clic, renvoi réseau).
 Remise sur ligne : gérant ou administrateur.
+
+## Commerce : clients, factures, avoirs, achats
+
+| Méthode | Route                               | Rôle requis |
+| ------- | ----------------------------------- | ----------- |
+| GET/POST/PATCH | `/customers`, `/customers/:id` | Admin, Gérant, Caissier (plafond : gérant) |
+| POST    | `/customers/:id/payments`           | idem — imputé aux factures les plus anciennes, idempotent |
+| GET     | `/customers/receivables`            | Admin, Gérant — balance âgée |
+| GET     | `/documents`, `/documents/:id`      | Admin, Gérant |
+| POST    | `/documents/quotes`                 | idem — devis `DEV-`, sans mouvement de stock |
+| POST    | `/documents/:id/convert`            | idem — devis → facture `FAC-` (une seule fois, avant expiration) |
+| POST    | `/documents/:id/refund`             | idem — avoir `AVR-` chaîné, retour en stock, imputation puis remboursement |
+| GET/POST| `/suppliers`, `/suppliers/:id/payments` | Achats : Admin, Gérant, Magasinier ; paiements : Admin, Gérant |
+| GET/POST| `/purchases`, `/purchases/:id`      | idem — bon `BR-`, entrée en stock, PMP recalculé |
+| POST    | `/stock/inventory/batch`            | Admin, Gérant, Magasinier — inventaire complet d'un dépôt |
+| GET     | `/exports/*.csv`                    | Admin, Gérant — ventes, stock, créances, achats, journal |
+| GET     | `/exports/chain-verify`             | Admin — recalcule la chaîne d'empreintes |
+
+Vente à crédit (`POST /sales` avec `customerId` et `credit: true`) : gérant ou
+administrateur, ou caissier si le paramètre l'autorise ; le plafond du client
+est vérifié sous verrou (`FOR UPDATE`).
 
 ## Code partagé
 

@@ -11,22 +11,43 @@ const TOUCH_EVERY_MS = 5 * 60 * 1000;
 
 const sha256 = (token: string) => createHash('sha256').update(token).digest('hex');
 
+/** Verrouillage du compte après N échecs consécutifs (anti force brute distribuée). */
+export const MAX_FAILED_LOGINS = 8;
+const LOCK_MS = 15 * 60 * 1000;
+const LOGIN_ERROR = 'E-mail ou mot de passe incorrect. Après plusieurs échecs, le compte est bloqué 15 minutes.';
+
 @Injectable()
 export class AuthService {
   constructor(private readonly prisma: PrismaService) {}
 
   async login(input: LoginInput, meta: { ip?: string; userAgent?: string }): Promise<LoginResponse> {
     const user = await this.prisma.user.findUnique({ where: { email: input.email } });
+    const locked = Boolean(user?.lockedUntil && user.lockedUntil > new Date());
+    // Le mot de passe est vérifié même si le compte est verrouillé : même durée de réponse.
     const ok = await verifyPassword(input.password, user?.passwordHash ?? (await dummyHash()));
 
-    // Même message pour un e-mail inconnu, un mauvais mot de passe ou un compte désactivé.
-    if (!user || !ok || !user.active) {
-      if (user) {
-        await this.prisma.auditLog.create({
-          data: { userId: user.id, action: 'auth.login_failed', entity: 'User', entityId: user.id, data: { ip: meta.ip ?? null } },
-        });
+    // Même message pour un e-mail inconnu, un mauvais mot de passe, un compte désactivé ou verrouillé.
+    if (!user || !ok || !user.active || locked) {
+      if (user && !locked) {
+        const failed = user.failedLogins + 1;
+        const lock = failed >= MAX_FAILED_LOGINS;
+        await this.prisma.$transaction([
+          this.prisma.user.update({
+            where: { id: user.id },
+            data: lock ? { failedLogins: 0, lockedUntil: new Date(Date.now() + LOCK_MS) } : { failedLogins: failed },
+          }),
+          this.prisma.auditLog.create({
+            data: {
+              userId: user.id,
+              action: lock ? 'auth.locked' : 'auth.login_failed',
+              entity: 'User',
+              entityId: user.id,
+              data: { ip: meta.ip ?? null, attempts: failed },
+            },
+          }),
+        ]);
       }
-      throw new UnauthorizedException('E-mail ou mot de passe incorrect');
+      throw new UnauthorizedException(LOGIN_ERROR);
     }
 
     const token = randomBytes(32).toString('base64url');
@@ -41,7 +62,7 @@ export class AuthService {
           userAgent: meta.userAgent?.slice(0, 300),
         },
       }),
-      this.prisma.user.update({ where: { id: user.id }, data: { lastLoginAt: new Date() } }),
+      this.prisma.user.update({ where: { id: user.id }, data: { lastLoginAt: new Date(), failedLogins: 0, lockedUntil: null } }),
       this.prisma.auditLog.create({
         data: { userId: user.id, action: 'auth.login', entity: 'User', entityId: user.id, data: { ip: meta.ip ?? null } },
       }),
@@ -73,6 +94,34 @@ export class AuthService {
 
   async logout(token: string): Promise<void> {
     await this.prisma.session.deleteMany({ where: { tokenHash: sha256(token) } });
+  }
+
+  /** Sessions ouvertes de l'utilisateur (appareils connectés). */
+  async sessions(userId: string, currentToken: string) {
+    const rows = await this.prisma.session.findMany({
+      where: { userId, expiresAt: { gt: new Date() } },
+      orderBy: { lastUsedAt: 'desc' },
+    });
+    const current = sha256(currentToken);
+    return rows.map((s) => ({
+      id: s.id,
+      createdAt: s.createdAt.toISOString(),
+      lastUsedAt: s.lastUsedAt.toISOString(),
+      ip: s.ip,
+      userAgent: s.userAgent,
+      current: s.tokenHash === current,
+    }));
+  }
+
+  /** Ferme une session de l'utilisateur (ex. téléphone perdu). */
+  async revokeSession(userId: string, sessionId: string) {
+    const { count } = await this.prisma.session.deleteMany({ where: { id: sessionId, userId } });
+    if (count) {
+      await this.prisma.auditLog.create({
+        data: { userId, action: 'auth.session_revoke', entity: 'Session', entityId: sessionId },
+      });
+    }
+    return { revoked: count };
   }
 
   /**

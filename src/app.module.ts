@@ -10,6 +10,9 @@ import { UsersModule } from './users/users.module.js';
 import { PosModule } from './pos/pos.module.js';
 import { SettingsModule } from './settings/settings.module.js';
 import { ReportsModule } from './reports/reports.module.js';
+import { BillingModule } from './billing/billing.module.js';
+import { CustomersModule } from './customers/customers.module.js';
+import { PurchasesModule } from './purchases/purchases.module.js';
 
 @Module({
   imports: [
@@ -22,6 +25,9 @@ import { ReportsModule } from './reports/reports.module.js';
     UsersModule,
     PosModule,
     ReportsModule,
+    BillingModule,
+    CustomersModule,
+    PurchasesModule,
   ],
   controllers: [AppController],
 })

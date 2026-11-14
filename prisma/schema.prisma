@@ -40,6 +40,9 @@ model User {
   // Mot de passe provisoire (créé / réinitialisé par un administrateur) :
   // l'utilisateur doit le changer avant de pouvoir faire quoi que ce soit.
   mustChangePassword Boolean   @default(false)
+  // Anti force brute par compte (en plus de la limite par adresse IP).
+  failedLogins       Int       @default(0)
+  lockedUntil        DateTime?
   lastLoginAt  DateTime?
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
@@ -100,6 +103,9 @@ model Settings {
   cashDifferenceTolerance Int      @default(500) // écart de caisse toléré (FCFA)
   minOpeningFloat         Int      @default(0) // fond de caisse minimum à l'ouverture
   receiptFooter           String   @default("Merci de votre visite !")
+  paymentTermDays         Int      @default(30) // échéance par défaut des ventes à crédit
+  quoteValidityDays       Int      @default(15)
+  cashierCanSellOnCredit  Boolean  @default(false)
   updatedAt               DateTime @updatedAt
 }
 
@@ -218,6 +224,7 @@ model Customer {
   address     String?
   ninea       String?
   creditLimit Int      @default(0) // plafond d'encours autorisé
+  notes       String?
   active      Boolean  @default(true)
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
@@ -274,6 +281,10 @@ model Invoice {
   discount      Int            @default(0) // remise globale / escompte (sur HT)
   vatTotal      Int            @default(0)
   total         Int            @default(0) // TTC net à payer
+  // Cumul des règlements imputés (cache, mis à jour dans la transaction du paiement).
+  // Reste dû = total − amountPaid. Pour un avoir : montant imputé + remboursé.
+  amountPaid    Int            @default(0)
+  validUntil    DateTime? // devis : date limite de validité
   notes         String?
   sourceId      String? // devis converti, ou facture d'origine d'un avoir
   hash          String? // empreinte SHA-256 chaînée (journal infalsifiable)
@@ -336,6 +347,7 @@ model Purchase {
   receivedAt  DateTime?
   dueDate     DateTime?
   total       Int            @default(0)
+  amountPaid  Int            @default(0) // reste dû au fournisseur = total − amountPaid
   notes       String?
   createdAt   DateTime       @default(now())
   updatedAt   DateTime       @updatedAt
@@ -375,6 +387,7 @@ enum PaymentMethod {
   BANK_TRANSFER
   CHEQUE
   CARD
+  CREDIT_NOTE // avoir imputé sur une facture (pas de mouvement d'argent)
 }
 
 enum PaymentDirection {
@@ -394,6 +407,8 @@ model Payment {
   cashSessionId String?
   userId        String
   receivedAt    DateTime         @default(now())
+  // Règlement fait à l'émission de la pièce (fait partie de son empreinte).
+  atIssue       Boolean          @default(false)
 
   invoice     Invoice?     @relation(fields: [invoiceId], references: [id])
   purchase    Purchase?    @relation(fields: [purchaseId], references: [id])

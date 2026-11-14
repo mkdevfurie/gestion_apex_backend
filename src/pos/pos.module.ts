@@ -6,5 +6,6 @@ import { SalesService } from './sales.service.js';
 @Module({
   controllers: [PosController],
   providers: [CashSessionsService, SalesService],
+  exports: [SalesService],
 })
 export class PosModule {}

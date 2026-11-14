@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: apex
+          POSTGRES_PASSWORD: apex_ci
+          POSTGRES_DB: apex_ci
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U apex" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgresql://apex:apex_ci@localhost:5432/apex_ci
+      DIRECT_URL: postgresql://apex:apex_ci@localhost:5432/apex_ci
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Client Prisma
+        run: pnpm exec prisma generate
+      - name: Migrations (base vierge)
+        run: pnpm exec prisma migrate deploy
+      - name: Schéma et migrations alignés
+        run: pnpm exec prisma migrate diff --from-config-datasource --to-schema prisma/schema.prisma --exit-code
+      - run: pnpm typecheck
+      - run: pnpm lint
+      - run: pnpm test
+      - run: pnpm test:e2e
+      - run: pnpm build
+      - name: Audit des dépendances
+        run: pnpm audit --prod --audit-level high

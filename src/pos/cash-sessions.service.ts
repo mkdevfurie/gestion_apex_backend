@@ -126,19 +126,23 @@ export class CashSessionsService {
     const [session, tickets, payments] = await Promise.all([
       db.cashSession.findUniqueOrThrow({ where: { id }, select: { openingFloat: true } }),
       db.invoice.aggregate({
-        where: { cashSessionId: id, status: 'ISSUED', kind: 'TICKET' },
+        where: { cashSessionId: id, status: 'ISSUED', kind: { in: ['TICKET', 'INVOICE'] } },
         _count: true,
         _sum: { total: true },
       }),
       db.payment.groupBy({
-        by: ['method'],
-        where: { cashSessionId: id, direction: 'IN' },
+        by: ['method', 'direction'],
+        where: { cashSessionId: id, method: { not: 'CREDIT_NOTE' } },
         _sum: { amount: true },
       }),
     ]);
-    const byMethod = payments
-      .map((p) => ({ method: p.method as PaymentMethod, amount: p._sum.amount ?? 0 }))
-      .sort((a, b) => b.amount - a.amount);
+    // Net par moyen : encaissements − remboursements (avoirs payés en caisse).
+    const net = new Map<PaymentMethod, number>();
+    for (const p of payments) {
+      const m = p.method as PaymentMethod;
+      net.set(m, (net.get(m) ?? 0) + (p.direction === 'IN' ? 1 : -1) * (p._sum.amount ?? 0));
+    }
+    const byMethod = [...net].map(([method, amount]) => ({ method, amount })).sort((a, b) => b.amount - a.amount);
     const cashIn = byMethod.find((p) => p.method === 'CASH')?.amount ?? 0;
     return {
       ticketCount: tickets._count,

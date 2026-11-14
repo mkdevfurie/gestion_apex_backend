@@ -5,8 +5,8 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { createHash } from 'node:crypto';
 import { Prisma } from '../generated/prisma/client.js';
+import { assertCreditAllowed } from '../customers/balance.js';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { SettingsService } from '../settings/settings.service.js';
 import { InsufficientStockError, applyMovement } from '../stock/apply-movement.js';
@@ -14,29 +14,155 @@ import {
   can,
   computeInvoiceTotals,
   formatXof,
+  MAX_AMOUNT,
   settlePayments,
   type AuthUser,
   type PaymentMethod,
   type SaleInput,
   type SaleReceipt,
 } from '../shared/index.js';
+import { openChainLink } from './documents.js';
 
 type Tx = Prisma.TransactionClient;
-
-/** Incrémente un compteur sans trou ; la ligne reste verrouillée jusqu'à la fin de la transaction. */
-async function nextValue(tx: Tx, key: string): Promise<number> {
-  await tx.$executeRaw`INSERT INTO "DocumentSequence" (key, "lastValue") VALUES (${key}, 0) ON CONFLICT (key) DO NOTHING`;
-  const rows = await tx.$queryRaw<{ lastValue: number }[]>`
-    UPDATE "DocumentSequence" SET "lastValue" = "lastValue" + 1 WHERE key = ${key} RETURNING "lastValue"`;
-  return rows[0].lastValue;
-}
+const DAY = 86_400_000;
 
 const receiptInclude = {
   lines: { orderBy: { position: 'asc' }, include: { product: { select: { sku: true, unit: true } } } },
   payments: { orderBy: { receivedAt: 'asc' } },
   user: { select: { name: true } },
   warehouse: { select: { code: true, name: true } },
+  customer: { select: { id: true, code: true, name: true } },
 } satisfies Prisma.InvoiceInclude;
+
+/** Lignes d'une vente : prix et TVA lus en base. */
+export type PricedLine = {
+  productId: string;
+  quantity: number;
+  discountRate: number;
+  unitPrice: number;
+  vatRate: number;
+  product: { sku: string; name: string; unit: string };
+};
+
+/**
+ * Écrit une pièce de vente émise (ticket ou facture) dans une transaction déjà
+ * ouverte : maillon de chaîne, lignes, sorties de stock, règlements, audit.
+ * Partagé par la caisse, la facture directe et la conversion de devis.
+ */
+export async function writeSale(
+  tx: Tx,
+  args: {
+    kind: 'TICKET' | 'INVOICE';
+    lines: PricedLine[];
+    payments: { method: PaymentMethod; amount: number; reference?: string }[];
+    warehouseId: string;
+    userId: string;
+    customerId?: string;
+    cashSessionId?: string;
+    clientRequestId?: string;
+    cashTendered?: number;
+    change?: number;
+    credit: number;
+    paymentTermDays: number;
+    sourceId?: string;
+    notes?: string | null;
+  },
+) {
+  const totals = computeInvoiceTotals(args.lines);
+  const link = await openChainLink(tx, args.kind === 'TICKET' ? 'TKT' : 'FAC');
+  const paid = args.payments.reduce((a, p) => a + p.amount, 0);
+  const hash = link.seal(
+    totals.total,
+    args.lines.map((l, i) => [l.product.sku, l.quantity, l.unitPrice, l.discountRate, l.vatRate, totals.lineTotals[i]]),
+    args.payments.map((p) => [p.method, p.amount]),
+  );
+
+  const invoice = await tx.invoice.create({
+    data: {
+      kind: args.kind,
+      status: 'ISSUED',
+      number: link.number,
+      issuedAt: link.issuedAt,
+      dueDate: args.credit > 0 ? new Date(link.issuedAt.getTime() + args.paymentTermDays * DAY) : null,
+      warehouseId: args.warehouseId,
+      userId: args.userId,
+      customerId: args.customerId,
+      cashSessionId: args.cashSessionId,
+      clientRequestId: args.clientRequestId,
+      sourceId: args.sourceId,
+      notes: args.notes ?? null,
+      subtotal: totals.subtotal,
+      discount: totals.discount,
+      vatTotal: totals.vatTotal,
+      total: totals.total,
+      amountPaid: paid,
+      hash,
+      previousHash: link.previousHash,
+      chainIndex: link.chainIndex,
+      cashTendered: args.cashTendered || null,
+      changeGiven: args.cashTendered ? (args.change ?? 0) : null,
+      lines: {
+        create: args.lines.map((l, i) => ({
+          productId: l.productId,
+          description: l.product.name,
+          quantity: l.quantity,
+          unitPrice: l.unitPrice,
+          discountRate: l.discountRate,
+          vatRate: l.vatRate,
+          lineTotal: totals.lineTotals[i],
+          position: i + 1,
+        })),
+      },
+    },
+  });
+
+  // Sorties de stock, articles triés (ordre de verrouillage stable entre transactions).
+  for (const l of [...args.lines].sort((a, b) => a.productId.localeCompare(b.productId))) {
+    try {
+      await applyMovement(tx, {
+        type: 'SALE',
+        productId: l.productId,
+        warehouseId: args.warehouseId,
+        quantity: l.quantity,
+        reason: link.number,
+        userId: args.userId,
+        invoiceId: invoice.id,
+      });
+    } catch (e) {
+      if (e instanceof InsufficientStockError) {
+        throw new ConflictException(`Stock insuffisant pour « ${l.product.name} » : ${e.available} ${l.product.unit} disponible(s)`);
+      }
+      throw e;
+    }
+  }
+
+  if (args.payments.length) {
+    await tx.payment.createMany({
+      data: args.payments.map((p) => ({
+        direction: 'IN' as const,
+        method: p.method,
+        amount: p.amount,
+        reference: p.reference,
+        invoiceId: invoice.id,
+        // Seules les espèces passent par le tiroir-caisse.
+        cashSessionId: p.method === 'CASH' ? args.cashSessionId : undefined,
+        userId: args.userId,
+        atIssue: true,
+      })),
+    });
+  }
+
+  await tx.auditLog.create({
+    data: {
+      userId: args.userId,
+      action: args.credit > 0 ? 'sale.credit' : args.kind === 'INVOICE' ? 'invoice.issue' : 'sale.issue',
+      entity: 'Invoice',
+      entityId: invoice.id,
+      data: { number: link.number, total: totals.total, credit: args.credit, customerId: args.customerId ?? null },
+    },
+  });
+  return invoice;
+}
 
 @Injectable()
 export class SalesService {
@@ -45,12 +171,31 @@ export class SalesService {
     private readonly settings: SettingsService,
   ) {}
 
+  /** Lit les articles et fixe prix / TVA depuis la base. */
+  async priceLines(lines: { productId: string; quantity: number; discountRate: number }[], user: AuthUser): Promise<PricedLine[]> {
+    if (lines.some((l) => l.discountRate > 0) && !can(user.role, 'grantDiscount')) {
+      throw new ForbiddenException('Seul un gérant peut accorder une remise');
+    }
+    const { maxDiscountRate } = await this.settings.get();
+    if (lines.some((l) => l.discountRate > maxDiscountRate)) {
+      throw new BadRequestException(`Remise maximale autorisée : ${maxDiscountRate} %`);
+    }
+    const ids = [...new Set(lines.map((l) => l.productId))];
+    const products = await this.prisma.product.findMany({ where: { id: { in: ids }, active: true } });
+    const byId = new Map(products.map((p) => [p.id, p]));
+    if (ids.some((id) => !byId.has(id))) throw new NotFoundException('Article introuvable ou désactivé');
+    return lines.map((l) => {
+      const p = byId.get(l.productId)!;
+      return { ...l, unitPrice: p.salePrice, vatRate: p.vatRate.toNumber(), product: { sku: p.sku, name: p.name, unit: p.unit } };
+    });
+  }
+
   /**
-   * Vente comptoir (ticket). Tout ou rien, dans une seule transaction :
-   * numéro sans trou, empreinte chaînée, lignes, sorties de stock, règlements.
+   * Vente comptoir (ticket) ou facture directe. Tout ou rien, dans une seule
+   * transaction : numéro sans trou, empreinte chaînée, lignes, stock, règlements.
    */
   async create(input: SaleInput, user: AuthUser): Promise<SaleReceipt> {
-    // Rejeu (double clic, réseau) : on renvoie le ticket déjà émis.
+    // Rejeu (double clic, réseau, file hors ligne) : on renvoie la pièce déjà émise.
     const replay = await this.prisma.invoice.findUnique({
       where: { clientRequestId: input.clientRequestId },
       select: { id: true, userId: true },
@@ -60,35 +205,32 @@ export class SalesService {
       return this.receipt(replay.id);
     }
 
-    if (input.lines.some((l) => l.discountRate > 0) && !can(user.role, 'grantDiscount')) {
-      throw new ForbiddenException('Seul un gérant peut accorder une remise');
+    if ((input.credit || input.kind === 'INVOICE') && !input.customerId) {
+      throw new BadRequestException(input.credit ? 'Choisissez le client pour une vente à crédit' : 'Une facture exige un client');
     }
-    const { maxDiscountRate } = await this.settings.get();
-    if (input.lines.some((l) => l.discountRate > maxDiscountRate)) {
-      throw new BadRequestException(`Remise maximale autorisée : ${maxDiscountRate} %`);
+    if (input.kind === 'INVOICE' && !can(user.role, 'issueInvoices')) {
+      throw new ForbiddenException('Seul un gérant peut émettre une facture');
     }
 
     const session = await this.prisma.cashSession.findFirst({
       where: { openedById: user.id, closedAt: null },
       select: { id: true, warehouseId: true },
     });
-    if (!session) throw new ConflictException('Ouvrez votre caisse avant d’encaisser');
+    const hasCash = input.payments.some((p) => p.method === 'CASH');
+    if (input.kind === 'TICKET' && !session) throw new ConflictException('Ouvrez votre caisse avant d’encaisser');
+    if (hasCash && !session) throw new ConflictException('Ouvrez votre caisse pour encaisser des espèces');
+    const warehouseId = session?.warehouseId ?? input.warehouseId;
+    if (!warehouseId) throw new BadRequestException('Précisez le dépôt de sortie');
 
-    // Prix et TVA de la base : le client n'envoie que les quantités.
-    const ids = [...new Set(input.lines.map((l) => l.productId))];
-    const products = await this.prisma.product.findMany({ where: { id: { in: ids }, active: true } });
-    const byId = new Map(products.map((p) => [p.id, p]));
-    const missing = ids.filter((id) => !byId.has(id));
-    if (missing.length) throw new NotFoundException('Article introuvable ou désactivé');
-
-    const lines = input.lines.map((l) => {
-      const p = byId.get(l.productId)!;
-      return { ...l, product: p, unitPrice: p.salePrice, vatRate: p.vatRate.toNumber() };
-    });
+    const settings = await this.settings.get();
+    const lines = await this.priceLines(input.lines, user);
     const totals = computeInvoiceTotals(lines);
-    if (totals.total <= 0) throw new BadRequestException('Le total du ticket doit être positif');
+    if (totals.total <= 0) throw new BadRequestException('Le total doit être positif');
+    if (totals.total > MAX_AMOUNT || totals.lineTotals.some((t) => t > MAX_AMOUNT)) {
+      throw new BadRequestException('Montant trop élevé pour une seule pièce');
+    }
 
-    const settlement = settlePayments(totals.total, input.payments);
+    const settlement = settlePayments(totals.total, input.payments, input.credit);
     if (!settlement.ok) {
       throw new BadRequestException(
         settlement.remaining > 0 ? `${settlement.error} : il manque ${formatXof(settlement.remaining)}` : settlement.error,
@@ -98,121 +240,36 @@ export class SalesService {
     try {
       const id = await this.prisma.$transaction(
         async (tx) => {
-          // 1. Chaîne d'empreintes globale, puis numéro annuel : verrous dans cet ordre, toujours.
-          //    L'heure est prise APRÈS le verrou : elle suit l'ordre de la chaîne.
-          const chainIndex = await nextValue(tx, 'CHAIN');
-          const issuedAt = new Date();
-          const seq = await nextValue(tx, `TKT-${issuedAt.getFullYear()}`);
-          const number = `TKT-${issuedAt.getFullYear()}-${String(seq).padStart(6, '0')}`;
-          const previous =
-            chainIndex > 1
-              ? await tx.invoice.findUnique({ where: { chainIndex: chainIndex - 1 }, select: { hash: true } })
-              : null;
-          if (chainIndex > 1 && !previous?.hash) {
-            throw new Error(`Chaîne d'empreintes incohérente : maillon ${chainIndex - 1} introuvable`);
+          if (input.customerId) {
+            const c = await tx.customer.findFirst({ where: { id: input.customerId, active: true }, select: { id: true } });
+            if (!c) throw new NotFoundException('Client introuvable ou désactivé');
           }
-          const previousHash = previous?.hash ?? null;
-          const hash = createHash('sha256')
-            .update(
-              JSON.stringify({
-                previousHash,
-                chainIndex,
-                number,
-                issuedAt: issuedAt.toISOString(),
-                total: totals.total,
-                lines: lines.map((l, i) => [l.product.sku, l.quantity, l.unitPrice, l.discountRate, l.vatRate, totals.lineTotals[i]]),
-                payments: settlement.applied.map((p) => [p.method, p.amount]),
-              }),
-            )
-            .digest('hex');
-
-          // 2. Le ticket et ses lignes (désignation figée).
-          const invoice = await tx.invoice.create({
-            data: {
-              kind: 'TICKET',
-              status: 'ISSUED',
-              number,
-              issuedAt,
-              warehouseId: session.warehouseId,
-              userId: user.id,
-              cashSessionId: session.id,
-              clientRequestId: input.clientRequestId,
-              subtotal: totals.subtotal,
-              discount: totals.discount,
-              vatTotal: totals.vatTotal,
-              total: totals.total,
-              hash,
-              previousHash,
-              chainIndex,
-              cashTendered: settlement.cashTendered || null,
-              changeGiven: settlement.cashTendered ? settlement.change : null,
-              lines: {
-                create: lines.map((l, i) => ({
-                  productId: l.productId,
-                  description: l.product.name,
-                  quantity: l.quantity,
-                  unitPrice: l.unitPrice,
-                  discountRate: l.discountRate,
-                  vatRate: l.vatRate,
-                  lineTotal: totals.lineTotals[i],
-                  position: i + 1,
-                })),
-              },
-            },
-          });
-
-          // 3. Sorties de stock, articles triés (ordre de verrouillage stable).
-          const ordered = [...lines].sort((a, b) => a.productId.localeCompare(b.productId));
-          for (const l of ordered) {
-            try {
-              await applyMovement(tx, {
-                type: 'SALE',
-                productId: l.productId,
-                warehouseId: session.warehouseId,
-                quantity: l.quantity,
-                reason: number,
-                userId: user.id,
-                invoiceId: invoice.id,
-              });
-            } catch (e) {
-              if (e instanceof InsufficientStockError) {
-                throw new ConflictException(
-                  `Stock insuffisant pour « ${l.product.name} » : ${e.available} ${l.product.unit} disponible(s)`,
-                );
-              }
-              throw e;
-            }
+          if (settlement.credit > 0) {
+            await assertCreditAllowed(tx, input.customerId!, settlement.credit, user, settings);
           }
-
-          // 4. Règlements imputés.
-          await tx.payment.createMany({
-            data: settlement.applied.map((p) => ({
-              direction: 'IN' as const,
-              method: p.method,
-              amount: p.amount,
-              reference: p.reference,
-              invoiceId: invoice.id,
-              cashSessionId: session.id,
-              userId: user.id,
-            })),
+          const w = await tx.warehouse.findFirst({ where: { id: warehouseId, active: true }, select: { id: true } });
+          if (!w) throw new NotFoundException('Dépôt introuvable ou inactif');
+          const inv = await writeSale(tx, {
+            kind: input.kind,
+            lines,
+            payments: settlement.applied,
+            warehouseId,
+            userId: user.id,
+            customerId: input.customerId,
+            cashSessionId: session?.id,
+            clientRequestId: input.clientRequestId,
+            cashTendered: settlement.cashTendered,
+            change: settlement.change,
+            credit: settlement.credit,
+            paymentTermDays: settings.paymentTermDays,
           });
-
-          await tx.auditLog.create({
-            data: {
-              userId: user.id,
-              action: 'sale.issue',
-              entity: 'Invoice',
-              entityId: invoice.id,
-              data: { number, total: totals.total },
-            },
-          });
-          return invoice.id;
+          return inv.id;
         },
         { maxWait: 10_000, timeout: 20_000 },
       );
       return this.receipt(id);
     } catch (e) {
-      // Deux envois simultanés du même panier : le second renvoie le ticket du premier.
+      // Deux envois simultanés du même panier : le second renvoie la pièce du premier.
       if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002') {
         const existing = await this.prisma.invoice.findUnique({
           where: { clientRequestId: input.clientRequestId },
@@ -230,7 +287,9 @@ export class SalesService {
       this.prisma.company.findUnique({ where: { id: 1 } }),
       this.settings.get(),
     ]);
-    if (!inv || !inv.number || !inv.issuedAt) throw new NotFoundException('Ticket introuvable');
+    if (!inv || !inv.number || !inv.issuedAt || (inv.kind !== 'TICKET' && inv.kind !== 'INVOICE')) {
+      throw new NotFoundException('Ticket introuvable');
+    }
 
     const lines = inv.lines.map((l) => ({
       sku: l.product?.sku ?? null,
@@ -242,11 +301,11 @@ export class SalesService {
       vatRate: l.vatRate.toNumber(),
       lineTotal: l.lineTotal,
     }));
-    // Ventilation TVA recalculée par la même fonction que lors de l'émission.
     const { vat } = computeInvoiceTotals(lines, inv.discount);
 
     return {
       id: inv.id,
+      kind: inv.kind,
       number: inv.number,
       issuedAt: inv.issuedAt.toISOString(),
       cashier: inv.user.name,
@@ -266,18 +325,23 @@ export class SalesService {
       vat,
       vatTotal: inv.vatTotal,
       total: inv.total,
-      payments: inv.payments.map((p) => ({ method: p.method as PaymentMethod, amount: p.amount, reference: p.reference })),
+      payments: inv.payments
+        .filter((p) => p.direction === 'IN' && p.method !== 'CREDIT_NOTE')
+        .map((p) => ({ method: p.method as PaymentMethod, amount: p.amount, reference: p.reference })),
       cashTendered: inv.cashTendered,
       change: inv.changeGiven,
       hash: inv.hash ?? '',
       footer: settings.receiptFooter,
+      customer: inv.customer,
+      balanceDue: Math.max(0, inv.total - inv.amountPaid),
+      dueDate: inv.dueDate?.toISOString() ?? null,
     };
   }
 
   /** Tickets d'une session (les plus récents d'abord). */
   async listForSession(sessionId: string) {
     const rows = await this.prisma.invoice.findMany({
-      where: { cashSessionId: sessionId, kind: 'TICKET', status: 'ISSUED' },
+      where: { cashSessionId: sessionId, kind: { in: ['TICKET', 'INVOICE'] }, status: 'ISSUED' },
       orderBy: { issuedAt: 'desc' },
       take: 50,
       select: { id: true, number: true, issuedAt: true, total: true, payments: { select: { method: true } } },

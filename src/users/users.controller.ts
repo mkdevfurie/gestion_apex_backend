@@ -39,6 +39,13 @@ export class UsersController {
     return this.users.update(id, body, actor);
   }
 
+  @Post(':id/revoke-sessions')
+  @RequirePermission('manageUsers')
+  @HttpCode(200)
+  revokeSessions(@Param('id', { schema: uuid }) id: string, @CurrentUser() actor: AuthUser) {
+    return this.users.revokeSessions(id, actor);
+  }
+
   @Post(':id/reset-password')
   @RequirePermission('manageUsers')
   @HttpCode(200)
