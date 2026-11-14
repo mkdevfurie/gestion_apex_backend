@@ -7,6 +7,7 @@ import { AuthModule } from './auth/auth.module.js';
 import { CatalogModule } from './catalog/catalog.module.js';
 import { StockModule } from './stock/stock.module.js';
 import { UsersModule } from './users/users.module.js';
+import { PosModule } from './pos/pos.module.js';
 
 @Module({
   imports: [
@@ -16,6 +17,7 @@ import { UsersModule } from './users/users.module.js';
     CatalogModule,
     StockModule,
     UsersModule,
+    PosModule,
   ],
   controllers: [AppController],
 })

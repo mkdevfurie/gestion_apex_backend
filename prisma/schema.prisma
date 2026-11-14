@@ -265,6 +265,14 @@ model Invoice {
   sourceId      String? // devis converti, ou facture d'origine d'un avoir
   hash          String? // empreinte SHA-256 chaînée (journal infalsifiable)
   previousHash  String?
+  // Position dans la chaîne d'empreintes (attribuée sous verrou) : le
+  // précédent est TOUJOURS chainIndex − 1, quelle que soit l'heure d'émission.
+  chainIndex    Int?           @unique
+  // Idempotence : un double clic ou un renvoi réseau ne crée pas deux tickets.
+  clientRequestId String? @unique
+  // Espèces remises par le client (pour imprimer « reçu / rendu »).
+  cashTendered  Int?
+  changeGiven   Int?
   cashSessionId String?
   createdAt     DateTime       @default(now())
   updatedAt     DateTime       @updatedAt
@@ -394,6 +402,7 @@ model CashSession {
   closedAt     DateTime?
   expectedCash Int? // calculé à la clôture (ticket Z)
   countedCash  Int? // compté physiquement
+  closingNotes String?
 
   warehouse Warehouse @relation(fields: [warehouseId], references: [id])
   openedBy  User      @relation("OpenedBy", fields: [openedById], references: [id])

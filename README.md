@@ -113,6 +113,25 @@ de la caisse.
 > L'API utilise le pilote `pg` (TCP) : les connexions inactives sont libérées
 > après 60 s, avant que Neon ne les coupe.
 
+## Caisse (point de vente)
+
+| Méthode | Route                         | Rôle requis |
+| ------- | ----------------------------- | ----------- |
+| GET     | `/cash-sessions/current`      | Administrateur, Gérant, Caissier |
+| POST    | `/cash-sessions`              | idem (ouverture : dépôt + fond de caisse) |
+| POST    | `/cash-sessions/:id/close`    | titulaire, ou gérant (comptage → ticket Z) |
+| POST    | `/sales`                      | idem (vente comptoir) |
+| GET     | `/sales/:id/receipt`          | émetteur, ou gérant (duplicata) |
+
+Une vente (`SalesService.create`) est **tout ou rien**, dans une transaction :
+prix et TVA lus en base (jamais envoyés par la caisse), numéro `TKT-AAAA-NNNNNN`
+sans trou, empreinte SHA-256 chaînée (`chainIndex` : le maillon précédent est
+toujours `chainIndex − 1`), sorties de stock, règlements. Les règlements sont
+répartis par `settlePayments` (partagé avec la caisse) : mobile money au montant
+exact, monnaie rendue uniquement sur les espèces, ticket soldé obligatoire.
+`clientRequestId` rend l'encaissement idempotent (double clic, renvoi réseau).
+Remise sur ligne : gérant ou administrateur.
+
 ## Code partagé
 
 `src/shared` (calculs de totaux/TVA, PMP, état du stock, `formatXof`, schémas Zod) existe aussi dans
